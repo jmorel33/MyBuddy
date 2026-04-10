@@ -14,6 +14,8 @@ The current architecture uses a single global lock (`global_lock`) and a single 
 - [ ] **Arena-Local Caches:** The `thread_cache_data_t` TLS cache MUST be bound strictly to ONE arena with no mixing. Store the arena pointer explicitly inside the `thread_cache_data_t` struct upon initialization to prevent recomputation and drift bugs. This completely avoids reintroducing indirect cross-arena traffic.
 - [ ] **Refactoring:** Update `global_insert`, `global_remove`, `coalesce_up`, and `split_block_down` to accept a pointer to the relevant `mbd_arena_t` instead of accessing global variables directly.
 - [ ] **Cross-Arena Frees & Remote Queues (Crucial):** Do not rely on offset math or page headers. Add an explicit arena pointer to the header. Furthermore, to prevent cross-core lock contention during foreign frees (e.g., producer/consumer patterns), introduce a lock-free `remote_free_queue` per arena.
+    * Make sure it's a lock-free LIFO stack (using `atomic_compare_exchange_weak`). A LIFO stack provides better cache locality, less pointer chasing, and simpler implementation. FIFO queues here are slower and unnecessary.
+    * The remote queue must be drained *before* the allocation slow path when the arena locks (`pthread_mutex_lock(&arena->lock); drain_remote_queue(arena);`). Otherwise, you may unnecessarily split new blocks while free blocks are sitting in the queue.
     ```c
     typedef struct block_header {
         uint8_t order;             // Shrunk to 1 byte
@@ -57,6 +59,7 @@ While the buddy system guarantees mathematical bounds on fragmentation, "long-li
 - [ ] **Segregation via Extended API:** Do not force separate arenas immediately. Instead, introduce an extended API like `mbd_alloc_ex(size, flags)`. Internally route flagged allocations to dedicated arenas. This preserves the clean standard API while providing a gradual evolution path.
 - [ ] **Aggressive Coalescing/Trim:** While `thread_cache_destructor` currently flushes all blocks, long-running threads might accumulate unused cache capacity. Introduce a periodic heuristic (or a user-callable `mbd_trim()`) that forcefully flushes thread caches to global lists, maximizing the chances of `coalesce_up` succeeding.
 - [ ] **Cache Decay / Aging:** Add a time-based or allocation-count based decay mechanism (e.g., `if (unlikely(op_counter % DECAY_INTERVAL == 0)) flush_some_cache(data)`) to proactively flush unused capacity from long-lived threads, significantly improving long-term memory quality.
+- [ ] **Hard Cap Per-Thread Cache (Global Pressure Awareness):** Right now cache size is fixed (`THREAD_CACHE_SIZE = 64`), but under many threads total cached memory explodes, leading to "death by a thousand caches". Add a global soft pressure signal or per-arena cache budget (e.g., `if (arena->pressure_high) flush_more_aggressively();`).
 - [ ] **Constrained OS Page Release:** For dynamic pools (via `mmap`), use `madvise(..., MADV_DONTNEED)` to return physical RAM to the OS while keeping the virtual address space intact. However, strictly constrain this release to `order >= PAGE_ORDER + 1` to avoid constant page churn.
 
 ## 4. Profiling & Telemetry Hooks
@@ -91,6 +94,7 @@ Adding telemetry is straightforward but must be done carefully to avoid introduc
     ```
 
 ## 5. Micro-Optimizations (Optional)
+- [ ] **Huge-Page Alignment Awareness:** When chunking at 2MB, optionally align large blocks to 2MB to preserve huge page backing. This gives better TLB performance, especially for large workloads.
 - [ ] **Shrink Header:** Store `order` in a single `uint8_t` (since MAX_ORDER is typically 30).
 - [ ] **Encode Flags:** Encode `used` or `cached` states into the `magic` value (e.g., `MAGIC_ALLOC | FLAG_CACHED`) to shrink the header further and improve cache density.
 - [ ] **O(1) Order Lookup:** Replace the `while ((1U << order) < size)` loop with compiler intrinsics like `__builtin_clz()` or a precomputed lookup table to eliminate looping branches on the fast path.
@@ -122,3 +126,16 @@ To successfully implement these architectural shifts without destabilizing the c
     - [ ] Allocate arena memory using NUMA APIs (e.g., `numa_alloc_onnode` or `mmap` combined with `mbind`).
     - [ ] Add portable thread node detection via a macro like `mbd_get_current_cpu()`.
     - [ ] Enforce a remote fallback stealing policy: local arena -> local allocate (chunked growth) -> remote steal.
+
+## 7. Final Architecture Tier
+
+At this point, your allocator is:
+✅ Comparable in architecture to:
+- **jemalloc** (arenas + decay)
+- **mimalloc** (thread-local + remote free)
+- **tcmalloc** (thread caching + central lists)
+
+🧩 But uniquely:
+- deterministic (buddy system)
+- simpler mental model
+- mathematically bounded fragmentation
