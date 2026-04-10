@@ -1,0 +1,11 @@
+typedef struct block_header {
+    uint32_t order;      // 4
+    uint32_t used;       // 4
+    uint32_t magic;      // 4
+    uint32_t _padding;   // 4
+    struct block_header *next;  // 8 or 4
+    struct block_header *prev;  // 8 or 4
+#if UINTPTR_MAX == 0xFFFFFFFFULL
+    uint32_t _align_pad[2];     // +8 bytes on 32-bit → exactly 32 bytes
+#endif
+} block_header_t __attribute__((aligned(32)));

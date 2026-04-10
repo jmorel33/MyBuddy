@@ -1,0 +1,5 @@
+/* ── Configuration Macros ─────────────────────────────────────────── */
+#define POOL_SIZE          (1ULL << 30)   // 1 GiB
+#define MAX_ORDER          30
+#define SMALL_ORDER_MAX    13             // includes 4 KiB pages
+#define THREAD_CACHE_SIZE  64

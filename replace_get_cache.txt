@@ -1,0 +1,93 @@
+static thread_cache_data_t *get_thread_cache(void) {
+    pthread_once(&init_once, internal_init);
+
+    thread_cache_data_t *data = pthread_getspecific(thread_cache_key);
+    if (!data) {
+        uint32_t t_id = atomic_fetch_add(&thread_counter, 1);
+        mbd_arena_t *arena = &arenas[t_id % arena_count];
+
+        /* Allocate cache struct from our own pool */
+        pthread_mutex_lock(&arena->lock);
+
+        uint32_t needed = (uint32_t)sizeof(thread_cache_data_t) + HEADER_SIZE;
+        uint32_t order  = 0;
+        uint32_t size   = next_power_of_two(needed);
+        while ((1U << order) < size) order++;
+
+        uint32_t cur = order;
+        while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
+        if (cur > MAX_ORDER) {
+            pthread_mutex_unlock(&arena->lock);
+            return NULL;
+        }
+
+        block_header_t *block = arena->free_lists[cur];
+        arena_remove(arena, block, cur);
+
+        /* Use the safe, non-duplicated helper */
+        block = split_block_down(arena, block, order);
+
+        block->used  = 1;
+        block->magic = MAGIC_ALLOC;
+        block->arena = arena;
+        block->next = block->prev = NULL;
+
+        data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
+        memset(data, 0, sizeof(thread_cache_data_t));
+        data->arena = arena;
+
+        if (pthread_setspecific(thread_cache_key, data) != 0) {
+            /* setspecific failed → return block to pool */
+            block->used = 0;
+            block->magic = MAGIC_FREE;
+            uint32_t o = block->order;
+
+            /* FIXED: Use the safe coalescing helper */
+            o = coalesce_up(arena, block, o);
+            arena_insert(arena, o, block);
+
+            pthread_mutex_unlock(&arena->lock);
+            return NULL;
+        }
+
+        pthread_mutex_unlock(&arena->lock);
+    }
+    return data;
+}
+
+/**
+ * @brief Refills a thread's local cache from the global free list.
+ * Will split larger blocks if exact-sized blocks are unavailable.
+ * @warning The caller MUST hold `global_lock` before calling this function.
+ *
+ * @param data Pointer to the thread's cache struct.
+ * @param order The block order (size) to refill.
+ */
+static void refill_thread_cache(thread_cache_data_t *data, uint32_t order) {
+    if (order > SMALL_ORDER_MAX) return;
+
+    mbd_arena_t *arena = data->arena;
+    while (data->count[order] < THREAD_CACHE_SIZE) {
+        block_header_t *block = arena->free_lists[order];
+        if (!block) {
+            /* No exact match — find the next larger block and split it down */
+            uint32_t cur = order + 1;
+            while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
+            if (cur > MAX_ORDER) break;
+
+            block = arena->free_lists[cur];
+            arena_remove(arena, block, cur);
+
+            /* FIXED: Use the safe non-duplicated helper */
+            block = split_block_down(arena, block, order);
+        } else {
+            arena_remove(arena, block, order);
+        }
+
+        block->arena = arena;
+        /* Add the (now exact-order) block to the thread-local cache */
+        block->next = data->cache[order];
+        data->cache[order] = block;
+        data->count[order]++;
+    }
+}

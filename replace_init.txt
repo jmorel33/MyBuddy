@@ -1,0 +1,29 @@
+static void internal_init(void) {
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) cores = 1;
+    arena_count = 2 * cores;
+
+    arenas = (mbd_arena_t *)malloc(sizeof(mbd_arena_t) * arena_count);
+    if (!arenas) abort();
+
+    for (int a = 0; a < arena_count; a++) {
+        pthread_mutex_init(&arenas[a].lock, NULL);
+        for (int i = 0; i <= MAX_ORDER; i++) arenas[a].free_lists[i] = NULL;
+        arenas[a].committed = POOL_SIZE;
+        arenas[a].reserved = POOL_SIZE;
+
+        arenas[a].memory_pool = (uint8_t *)mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (arenas[a].memory_pool == MAP_FAILED) abort();
+
+        block_header_t *initial = (block_header_t *)arenas[a].memory_pool;
+        initial->order = MAX_ORDER;
+        initial->used  = 0;
+        initial->magic = MAGIC_FREE;
+        initial->arena = &arenas[a];
+        initial->next = initial->prev = NULL;
+
+        arenas[a].free_lists[MAX_ORDER] = initial;
+    }
+
+    pthread_key_create(&thread_cache_key, thread_cache_destructor);
+}

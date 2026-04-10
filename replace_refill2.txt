@@ -1,0 +1,25 @@
+            /* No exact match — find the next larger block and split it down */
+            uint32_t cur = order + 1;
+            while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
+
+            if (cur > MAX_ORDER) {
+                /* Fallback */
+                int found = 0;
+                for (int i = 0; i < arena_count; i++) {
+                    mbd_arena_t *other_arena = &arenas[i];
+                    if (other_arena == arena) continue;
+
+                    pthread_mutex_lock(&other_arena->lock);
+                    cur = order + 1; // Wait, actually we can satisfy order directly from other arenas, but refill_thread_cache assumes returning from split.
+                    // Instead of full fallback here, just break and let mbd_alloc handle fallback for the current allocation if cache is empty.
+                    // Actually, breaking here is safe, the cache just won't be fully refilled.
+                    pthread_mutex_unlock(&other_arena->lock);
+                }
+                break;
+            }
+
+            block = arena->free_lists[cur];
+            arena_remove(arena, block, cur);
+
+            /* FIXED: Use the safe non-duplicated helper */
+            block = split_block_down(arena, block, order);

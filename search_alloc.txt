@@ -1,0 +1,63 @@
+void *mbd_alloc(size_t requested_size) {
+    if (requested_size == 0) return NULL;
+    if (requested_size > POOL_SIZE - HEADER_SIZE) {
+        fprintf(stderr, "mybuddy: request too large\n");
+        return NULL;
+    }
+
+    thread_cache_data_t *data = get_thread_cache();
+    if (!data) return NULL;
+
+    size_t needed = requested_size + HEADER_SIZE;
+    uint32_t order = 0;
+    uint32_t size  = next_power_of_two(needed);
+    while ((1U << order) < size) order++;
+
+    /* HOT PATH — lock-free */
+    if (order <= SMALL_ORDER_MAX && data->cache[order]) {
+        block_header_t *block = data->cache[order];
+        data->cache[order] = block->next;
+        data->count[order]--;
+        block->used  = 1;
+        block->magic = MAGIC_ALLOC;
+        block->next = block->prev = NULL;
+        return (void *)((uint8_t*)block + HEADER_SIZE);
+    }
+
+    pthread_mutex_lock(&global_lock);
+
+    if (order <= SMALL_ORDER_MAX) {
+        refill_thread_cache(data, order);
+        if (data->cache[order]) {
+            block_header_t *block = data->cache[order];
+            data->cache[order] = block->next;
+            data->count[order]--;
+            block->used  = 1;
+            block->magic = MAGIC_ALLOC;
+            block->next = block->prev = NULL;
+            pthread_mutex_unlock(&global_lock);
+            return (void *)((uint8_t*)block + HEADER_SIZE);
+        }
+    }
+
+    /* Global slow path */
+    uint32_t cur = order;
+    while (cur <= MAX_ORDER && !global_free_lists[cur]) cur++;
+    if (cur > MAX_ORDER) {
+        pthread_mutex_unlock(&global_lock);
+        return NULL;
+    }
+
+    block_header_t *block = global_free_lists[cur];
+    global_remove(block, cur);
+
+    /* FIXED: Use the safe, non-duplicated helper (eliminates the get_buddy bug) */
+    block = split_block_down(block, order);
+
+    block->used  = 1;
+    block->magic = MAGIC_ALLOC;
+    block->next = block->prev = NULL;
+
+    pthread_mutex_unlock(&global_lock);
+    return (void *)((uint8_t*)block + HEADER_SIZE);
+}

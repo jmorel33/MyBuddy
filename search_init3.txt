@@ -1,0 +1,10 @@
+static void internal_init(void) {
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) cores = 1;
+    arena_count = 2 * cores;
+
+    size_t arenas_size = sizeof(mbd_arena_t) * arena_count;
+    arenas = (mbd_arena_t *)mmap(NULL, arenas_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+    if (arenas == MAP_FAILED) abort();
+
+    for (int a = 0; a < arena_count; a++) {

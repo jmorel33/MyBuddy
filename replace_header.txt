@@ -1,0 +1,22 @@
+struct mbd_arena;
+
+typedef struct block_header {
+    uint8_t order;      // 1
+    uint8_t used;       // 1
+    uint16_t _padding;  // 2
+    uint32_t magic;     // 4
+    struct mbd_arena *arena; // 8 or 4
+    struct block_header *next;  // 8 or 4
+    struct block_header *prev;  // 8 or 4
+#if UINTPTR_MAX == 0xFFFFFFFFULL
+    uint32_t _align_pad[2];     // +8 bytes on 32-bit → exactly 32 bytes
+#endif
+} block_header_t __attribute__((aligned(32)));
+
+typedef struct mbd_arena {
+    pthread_mutex_t lock;
+    block_header_t *free_lists[MAX_ORDER + 1];
+    size_t committed;
+    size_t reserved;
+    uint8_t *memory_pool;
+} mbd_arena_t;

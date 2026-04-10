@@ -1,0 +1,5 @@
+typedef struct thread_cache_data {
+    block_header_t *cache[SMALL_ORDER_MAX + 1];
+    uint32_t        count[SMALL_ORDER_MAX + 1];
+    mbd_arena_t    *arena;
+} thread_cache_data_t;

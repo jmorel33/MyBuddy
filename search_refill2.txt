@@ -1,0 +1,10 @@
+            /* No exact match — find the next larger block and split it down */
+            uint32_t cur = order + 1;
+            while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
+            if (cur > MAX_ORDER) break;
+
+            block = arena->free_lists[cur];
+            arena_remove(arena, block, cur);
+
+            /* FIXED: Use the safe non-duplicated helper */
+            block = split_block_down(arena, block, order);

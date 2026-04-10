@@ -1,0 +1,13 @@
+static void internal_init(void) {
+    //memset(memory_pool, 0, POOL_SIZE); // The pool is already zeroed by the OS via .bss.
+    for (int i = 0; i <= MAX_ORDER; i++) global_free_lists[i] = NULL;
+
+    block_header_t *initial = (block_header_t *)memory_pool;
+    initial->order = MAX_ORDER;
+    initial->used  = 0;
+    initial->magic = MAGIC_FREE;
+    initial->next = initial->prev = NULL;
+    global_insert(MAX_ORDER, initial);
+
+    pthread_key_create(&thread_cache_key, thread_cache_destructor);
+}

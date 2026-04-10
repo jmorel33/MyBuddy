@@ -1,0 +1,10 @@
+    /* Global slow path */
+    uint32_t cur = order;
+    while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
+    if (cur > MAX_ORDER) {
+        pthread_mutex_unlock(&arena->lock);
+        return NULL;
+    }
+
+    block_header_t *block = arena->free_lists[cur];
+    arena_remove(arena, block, cur);

@@ -32,24 +32,24 @@
  *
  * @note There is intentionally no `mbd_destroy()` function. Production allocators are designed to live for the entire lifetime of the process.
  * The OS reclaims the memory on exit.
- * 
+ *
  * @example
  * @code
  * #include "mybuddy.h"
- * 
+ *
  * int main() {
  *     // Optional: Pre-warm the allocator before spawning threads
- *     mbd_init(); 
- * 
+ *     mbd_init();
+ *
  *     // Lock-free fast path (falls under SMALL_ORDER_MAX)
  *     char *string_buffer = mbd_alloc(128);
- * 
+ *
  *     // Global slow path (bypasses cache, carves 2MB block)
  *     void *texture_asset = mbd_alloc(1024 * 1024 * 2);
- * 
+ *
  *     mbd_free(string_buffer);
  *     mbd_free(texture_asset);
- * 
+ *
  *     return 0; // OS reclaims memory pool. No leaks.
  * }
  * @endcode
@@ -66,8 +66,8 @@ extern "C" {
 #endif
 
 /* ── Configuration Macros ─────────────────────────────────────────── */
-#define POOL_SIZE          (1ULL << 30)   // 1 GiB
-#define MAX_ORDER          30
+#define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
+#define MAX_ORDER          27
 #define SMALL_ORDER_MAX    13             // includes 4 KiB pages
 #define THREAD_CACHE_SIZE  64
 
@@ -102,17 +102,28 @@ char *mbd_string_view_dup(mbd_string_view_t view);                          // A
 /* ── Internal types (not needed by callers) ───────────────────────── */
 //#define CACHELINE_ALIGN    __attribute__((aligned(64)))
 
+struct mbd_arena;
+
 typedef struct block_header {
-    uint32_t order;      // 4
-    uint32_t used;       // 4
-    uint32_t magic;      // 4
-    uint32_t _padding;   // 4
+    uint8_t order;      // 1
+    uint8_t used;       // 1
+    uint16_t _padding;  // 2
+    uint32_t magic;     // 4
+    struct mbd_arena *arena; // 8 or 4
     struct block_header *next;  // 8 or 4
     struct block_header *prev;  // 8 or 4
 #if UINTPTR_MAX == 0xFFFFFFFFULL
     uint32_t _align_pad[2];     // +8 bytes on 32-bit → exactly 32 bytes
 #endif
 } block_header_t __attribute__((aligned(32)));
+
+typedef struct mbd_arena {
+    pthread_mutex_t lock;
+    block_header_t *free_lists[MAX_ORDER + 1];
+    size_t committed;
+    size_t reserved;
+    uint8_t *memory_pool;
+} mbd_arena_t;
 
 #include <stdio.h>
 #include <string.h>
@@ -130,12 +141,17 @@ typedef struct block_header {
 typedef struct thread_cache_data {
     block_header_t *cache[SMALL_ORDER_MAX + 1];
     uint32_t        count[SMALL_ORDER_MAX + 1];
+    mbd_arena_t    *arena;
 } thread_cache_data_t;
 
-static uint8_t memory_pool[POOL_SIZE] __attribute__((aligned(32)));
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdatomic.h>
 
-static block_header_t *global_free_lists[MAX_ORDER + 1] = {0};
-static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
+static mbd_arena_t *arenas = NULL;
+static int arena_count = 1;
+static _Atomic uint32_t thread_counter = 0;
+
 static pthread_key_t thread_cache_key;
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
 
@@ -144,33 +160,20 @@ static const uint32_t MAGIC_FREE   = 0xDEADBEEF;
 static const uint32_t MAGIC_CACHED = 0xBAADF00D;
 
 /* ================================================================== *
- *                       GLOBAL LIST OPERATIONS                       *
+ *                       ARENA LIST OPERATIONS                        *
  * ================================================================== */
 
-/**
- * @brief Inserts a block into the global doubly-linked free list.
- * @warning The caller MUST hold `global_lock` before calling this function.
- * 
- * @param order The power-of-two order (index) of the block.
- * @param block The block to insert.
- */
-static void global_insert(uint32_t order, block_header_t *block) {
+static void arena_insert(mbd_arena_t *arena, uint32_t order, block_header_t *block) {
     block->prev = NULL;
-    block->next = global_free_lists[order];
-    if (global_free_lists[order]) global_free_lists[order]->prev = block;
-    global_free_lists[order] = block;
+    block->next = arena->free_lists[order];
+    if (arena->free_lists[order]) arena->free_lists[order]->prev = block;
+    arena->free_lists[order] = block;
+    block->arena = arena;
 }
 
-/**
- * @brief Removes a block from the global doubly-linked free list (O(1)).
- * @warning The caller MUST hold `global_lock` before calling this function.
- * 
- * @param block The block to remove.
- * @param order The power-of-two order (index) of the block.
- */
-static void global_remove(block_header_t *block, uint32_t order) {
+static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
     if (block->prev) block->prev->next = block->next;
-    else             global_free_lists[order] = block->next;
+    else             arena->free_lists[order] = block->next;
     if (block->next) block->next->prev = block->prev;
     block->prev = block->next = NULL;
 }
@@ -179,14 +182,6 @@ static void global_remove(block_header_t *block, uint32_t order) {
  *                       HELPER FUNCTIONS                             *
  * ================================================================== */
 
-/**
- * @brief Rounds up a requested size to the nearest power of two.
- * Uses a standard bit-twiddling algorithm. Includes a fallback for 64-bit 
- * integers if compiled on a 64-bit architecture.
- * 
- * @param req The requested memory size in bytes.
- * @return uint32_t The nearest power of two >= req (minimum MIN_BLOCK).
- */
 static inline uint32_t next_power_of_two(size_t req) {
     if (req <= MIN_BLOCK) return MIN_BLOCK;
     req--;
@@ -198,59 +193,34 @@ static inline uint32_t next_power_of_two(size_t req) {
     return (uint32_t)(req + 1);
 }
 
-/**
- * @brief Calculates the exact memory address of a block's "buddy".
- * Uses relative offset XOR math. Added alignment check to prevent
- * future maintenance footguns if someone calls it with the wrong order.
- */
-static inline block_header_t *get_buddy(block_header_t *block, uint32_t order) {
-    uintptr_t offset = (uintptr_t)block - (uintptr_t)memory_pool;
-
-    /* Defensive check: block must be properly aligned for this order */
+static inline block_header_t *get_buddy(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
+    uintptr_t offset = (uintptr_t)block - (uintptr_t)arena->memory_pool;
     if (offset & ((1ULL << order) - 1)) return NULL;
-
     uintptr_t buddy_offset = offset ^ (1ULL << order);
     if (buddy_offset >= POOL_SIZE) return NULL;
-    return (block_header_t *)(memory_pool + buddy_offset);
+    return (block_header_t *)(arena->memory_pool + buddy_offset);
 }
 
-/**
- * @brief Splits a large block down to the exact target order, inserting
- *        all buddy blocks into the global free list as it descends.
- * @warning Caller MUST hold `global_lock`. The input block must already
- *          have been removed from any free list.
- *
- * @param block        Block with order >= target_order
- * @param target_order Desired final order
- * @return block_header_t* The final block of exactly `target_order`
- */
-static block_header_t* split_block_down(block_header_t *block, uint32_t target_order) {
+static block_header_t* split_block_down(mbd_arena_t *arena, block_header_t *block, uint32_t target_order) {
     while (block->order > target_order) {
         uint32_t new_order = block->order - 1;
-        block_header_t *buddy = get_buddy(block, new_order);
+        block_header_t *buddy = get_buddy(arena, block, new_order);
         buddy->order = new_order;
         buddy->used  = 0;
         buddy->magic = MAGIC_FREE;
+        buddy->arena = arena;
         buddy->next = buddy->prev = NULL;
-        global_insert(new_order, buddy);
+        arena_insert(arena, new_order, buddy);
         block->order = new_order;
     }
     return block;
 }
 
-/**
- * @brief Coalesces a block upward with its buddies as far as possible.
- * @warning Caller MUST hold `global_lock`.
- *
- * @param block Pointer to the newly-freed block
- * @param order Its current order
- * @return uint32_t Final coalesced order after all possible merges
- */
-static uint32_t coalesce_up(block_header_t *block, uint32_t order) {
+static uint32_t coalesce_up(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
     while (order < MAX_ORDER) {
-        block_header_t *buddy = get_buddy(block, order);
-        if (!buddy || buddy->magic != MAGIC_FREE || buddy->order != order) break;
-        global_remove(buddy, order);
+        block_header_t *buddy = get_buddy(arena, block, order);
+        if (!buddy || buddy->magic != MAGIC_FREE || buddy->order != order || buddy->arena != arena) break;
+        arena_remove(arena, buddy, order);
         if ((uintptr_t)block > (uintptr_t)buddy) block = buddy;
         block->order = order + 1;
         order++;
@@ -264,17 +234,18 @@ static uint32_t coalesce_up(block_header_t *block, uint32_t order) {
 
 /**
  * @brief POSIX Thread Destructor.
- * Automatically invoked by the OS when a thread terminates. Flushes all 
- * remaining cached blocks to the global pool, then safely frees the cache 
+ * Automatically invoked by the OS when a thread terminates. Flushes all
+ * remaining cached blocks to the global pool, then safely frees the cache
  * struct itself to completely prevent memory leaks.
- * 
+ *
  * @param arg Pointer to the thread's `thread_cache_data_t` struct.
  */
 static void thread_cache_destructor(void *arg) {
     thread_cache_data_t *data = arg;
     if (!data) return;
 
-    pthread_mutex_lock(&global_lock);
+    mbd_arena_t *arena = data->arena;
+    pthread_mutex_lock(&arena->lock);
 
     /* Flush all cached blocks */
     for (int o = 0; o <= SMALL_ORDER_MAX; o++) {
@@ -287,8 +258,8 @@ static void thread_cache_destructor(void *arg) {
             uint32_t order = block->order;
 
             /* Use the safe coalescing helper */
-            order = coalesce_up(block, order);
-            global_insert(order, block);
+            order = coalesce_up(arena, block, order);
+            arena_insert(arena, order, block);
         }
     }
 
@@ -299,26 +270,46 @@ static void thread_cache_destructor(void *arg) {
     uint32_t co = cache_block->order;
 
     /* Use the new safe helper */
-    co = coalesce_up(cache_block, co);
-    global_insert(co, cache_block);
+    co = coalesce_up(arena, cache_block, co);
+    arena_insert(arena, co, cache_block);
 
-    pthread_mutex_unlock(&global_lock);
+    pthread_mutex_unlock(&arena->lock);
 }
 
 /**
  * @brief Internal allocator initialization.
  * Executed exactly once during the lifetime of the program via `pthread_once`.
  */
-static void internal_init(void) {
-    //memset(memory_pool, 0, POOL_SIZE); // The pool is already zeroed by the OS via .bss.
-    for (int i = 0; i <= MAX_ORDER; i++) global_free_lists[i] = NULL;
+// Keep a small hard limit on memory so we don't blow up 32-bit systems
+#define MBD_MAX_ARENAS 16
+static mbd_arena_t static_arenas[MBD_MAX_ARENAS];
 
-    block_header_t *initial = (block_header_t *)memory_pool;
-    initial->order = MAX_ORDER;
-    initial->used  = 0;
-    initial->magic = MAGIC_FREE;
-    initial->next = initial->prev = NULL;
-    global_insert(MAX_ORDER, initial);
+static void internal_init(void) {
+    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    if (cores < 1) cores = 1;
+    arena_count = 2 * cores;
+    if (arena_count > MBD_MAX_ARENAS) arena_count = MBD_MAX_ARENAS;
+
+    arenas = static_arenas;
+
+    for (int a = 0; a < arena_count; a++) {
+        pthread_mutex_init(&arenas[a].lock, NULL);
+        for (int i = 0; i <= MAX_ORDER; i++) arenas[a].free_lists[i] = NULL;
+        arenas[a].committed = POOL_SIZE;
+        arenas[a].reserved = POOL_SIZE;
+
+        arenas[a].memory_pool = (uint8_t *)mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (arenas[a].memory_pool == MAP_FAILED) abort();
+
+        block_header_t *initial = (block_header_t *)arenas[a].memory_pool;
+        initial->order = MAX_ORDER;
+        initial->used  = 0;
+        initial->magic = MAGIC_FREE;
+        initial->arena = &arenas[a];
+        initial->next = initial->prev = NULL;
+
+        arenas[a].free_lists[MAX_ORDER] = initial;
+    }
 
     pthread_key_create(&thread_cache_key, thread_cache_destructor);
 }
@@ -326,9 +317,9 @@ static void internal_init(void) {
 /**
  * @brief Retrieves the Thread-Local cache data.
  * If the thread does not have a cache, one is created. To remain completely
- * independent of the libc standard allocator (for LD_PRELOAD support), 
+ * independent of the libc standard allocator (for LD_PRELOAD support),
  * the cache structure is allocated directly from our own memory pool.
- * 
+ *
  * @return thread_cache_data_t* Pointer to the thread's cache, or NULL on OOM.
  */
 static thread_cache_data_t *get_thread_cache(void) {
@@ -336,8 +327,11 @@ static thread_cache_data_t *get_thread_cache(void) {
 
     thread_cache_data_t *data = pthread_getspecific(thread_cache_key);
     if (!data) {
+        uint32_t t_id = atomic_fetch_add(&thread_counter, 1);
+        mbd_arena_t *arena = &arenas[t_id % arena_count];
+
         /* Allocate cache struct from our own pool */
-        pthread_mutex_lock(&global_lock);
+        pthread_mutex_lock(&arena->lock);
 
         uint32_t needed = (uint32_t)sizeof(thread_cache_data_t) + HEADER_SIZE;
         uint32_t order  = 0;
@@ -345,24 +339,67 @@ static thread_cache_data_t *get_thread_cache(void) {
         while ((1U << order) < size) order++;
 
         uint32_t cur = order;
-        while (cur <= MAX_ORDER && !global_free_lists[cur]) cur++;
+        while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
+
         if (cur > MAX_ORDER) {
-            pthread_mutex_unlock(&global_lock);
+            pthread_mutex_unlock(&arena->lock);
+
+            /* Fallback */
+            block_header_t *block = NULL;
+            for (int i = 0; i < arena_count; i++) {
+                mbd_arena_t *other_arena = &arenas[i];
+                if (other_arena == arena) continue;
+
+                pthread_mutex_lock(&other_arena->lock);
+                cur = order;
+                while (cur <= MAX_ORDER && !other_arena->free_lists[cur]) cur++;
+
+                if (cur <= MAX_ORDER) {
+                    block = other_arena->free_lists[cur];
+                    arena_remove(other_arena, block, cur);
+                    block = split_block_down(other_arena, block, order);
+                    block->used  = 1;
+                    block->magic = MAGIC_ALLOC;
+                    block->arena = other_arena;
+                    block->next = block->prev = NULL;
+
+                    data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
+                    memset(data, 0, sizeof(thread_cache_data_t));
+                    data->arena = arena; // Bind to original arena
+
+                    if (pthread_setspecific(thread_cache_key, data) != 0) {
+                        block->used = 0;
+                        block->magic = MAGIC_FREE;
+                        uint32_t o = block->order;
+                        o = coalesce_up(other_arena, block, o);
+                        arena_insert(other_arena, o, block);
+                        pthread_mutex_unlock(&other_arena->lock);
+                        return NULL;
+                    }
+
+                    pthread_mutex_unlock(&other_arena->lock);
+                    return data;
+                }
+                pthread_mutex_unlock(&other_arena->lock);
+            }
+
             return NULL;
         }
 
-        block_header_t *block = global_free_lists[cur];
-        global_remove(block, cur);
+        block_header_t *block = arena->free_lists[cur];
+        arena_remove(arena, block, cur);
 
         /* Use the safe, non-duplicated helper */
-        block = split_block_down(block, order);
+        block = split_block_down(arena, block, order);
 
         block->used  = 1;
         block->magic = MAGIC_ALLOC;
+        block->arena = arena;
         block->next = block->prev = NULL;
 
         data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
         memset(data, 0, sizeof(thread_cache_data_t));
+        data->arena = arena;
 
         if (pthread_setspecific(thread_cache_key, data) != 0) {
             /* setspecific failed → return block to pool */
@@ -371,14 +408,14 @@ static thread_cache_data_t *get_thread_cache(void) {
             uint32_t o = block->order;
 
             /* FIXED: Use the safe coalescing helper */
-            o = coalesce_up(block, o);
-            global_insert(o, block);
+            o = coalesce_up(arena, block, o);
+            arena_insert(arena, o, block);
 
-            pthread_mutex_unlock(&global_lock);
+            pthread_mutex_unlock(&arena->lock);
             return NULL;
         }
 
-        pthread_mutex_unlock(&global_lock);
+        pthread_mutex_unlock(&arena->lock);
     }
     return data;
 }
@@ -387,30 +424,47 @@ static thread_cache_data_t *get_thread_cache(void) {
  * @brief Refills a thread's local cache from the global free list.
  * Will split larger blocks if exact-sized blocks are unavailable.
  * @warning The caller MUST hold `global_lock` before calling this function.
- * 
+ *
  * @param data Pointer to the thread's cache struct.
  * @param order The block order (size) to refill.
  */
 static void refill_thread_cache(thread_cache_data_t *data, uint32_t order) {
     if (order > SMALL_ORDER_MAX) return;
 
+    mbd_arena_t *arena = data->arena;
     while (data->count[order] < THREAD_CACHE_SIZE) {
-        block_header_t *block = global_free_lists[order];
+        block_header_t *block = arena->free_lists[order];
         if (!block) {
             /* No exact match — find the next larger block and split it down */
             uint32_t cur = order + 1;
-            while (cur <= MAX_ORDER && !global_free_lists[cur]) cur++;
-            if (cur > MAX_ORDER) break;
+            while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
 
-            block = global_free_lists[cur];
-            global_remove(block, cur);
+            if (cur > MAX_ORDER) {
+                /* Fallback */
+                int found = 0;
+                for (int i = 0; i < arena_count; i++) {
+                    mbd_arena_t *other_arena = &arenas[i];
+                    if (other_arena == arena) continue;
+
+                    pthread_mutex_lock(&other_arena->lock);
+                    cur = order + 1; // Wait, actually we can satisfy order directly from other arenas, but refill_thread_cache assumes returning from split.
+                    // Instead of full fallback here, just break and let mbd_alloc handle fallback for the current allocation if cache is empty.
+                    // Actually, breaking here is safe, the cache just won't be fully refilled.
+                    pthread_mutex_unlock(&other_arena->lock);
+                }
+                break;
+            }
+
+            block = arena->free_lists[cur];
+            arena_remove(arena, block, cur);
 
             /* FIXED: Use the safe non-duplicated helper */
-            block = split_block_down(block, order);
+            block = split_block_down(arena, block, order);
         } else {
-            global_remove(block, order);
+            arena_remove(arena, block, order);
         }
 
+        block->arena = arena;
         /* Add the (now exact-order) block to the thread-local cache */
         block->next = data->cache[order];
         data->cache[order] = block;
@@ -424,12 +478,12 @@ static void refill_thread_cache(thread_cache_data_t *data, uint32_t order) {
 
 /**
  * @brief Explicitly initializes the allocator (Optional).
- * 
+ *
  * The allocator is fully self-initializing; it will automatically set itself
  * up on the first call to mbd_alloc(). However, if you want to pre-warm the
- * memory pool and prevent initialization latency on the first allocation, 
+ * memory pool and prevent initialization latency on the first allocation,
  * you can call this function during your application's startup phase.
- * 
+ *
  * This function is thread-safe and idempotent.
  */
 void mbd_init(void) {
@@ -441,7 +495,7 @@ void mbd_init(void) {
  * Tries the lock-free, O(1) Thread-Local Cache fast-path first. If empty
  * or the requested size is large, acquires the global lock and splits
  * blocks via standard Buddy system rules (now using the safe helper).
- * 
+ *
  * @param requested_size The size of memory requested in bytes.
  * @return void* Pointer to the 32-byte aligned payload, or NULL on OOM/error.
  */
@@ -454,6 +508,7 @@ void *mbd_alloc(size_t requested_size) {
 
     thread_cache_data_t *data = get_thread_cache();
     if (!data) return NULL;
+    mbd_arena_t *arena = data->arena;
 
     size_t needed = requested_size + HEADER_SIZE;
     uint32_t order = 0;
@@ -467,11 +522,12 @@ void *mbd_alloc(size_t requested_size) {
         data->count[order]--;
         block->used  = 1;
         block->magic = MAGIC_ALLOC;
+        block->arena = arena;
         block->next = block->prev = NULL;
         return (void *)((uint8_t*)block + HEADER_SIZE);
     }
 
-    pthread_mutex_lock(&global_lock);
+    pthread_mutex_lock(&arena->lock);
 
     if (order <= SMALL_ORDER_MAX) {
         refill_thread_cache(data, order);
@@ -481,49 +537,85 @@ void *mbd_alloc(size_t requested_size) {
             data->count[order]--;
             block->used  = 1;
             block->magic = MAGIC_ALLOC;
+            block->arena = arena;
             block->next = block->prev = NULL;
-            pthread_mutex_unlock(&global_lock);
+            pthread_mutex_unlock(&arena->lock);
             return (void *)((uint8_t*)block + HEADER_SIZE);
         }
     }
 
     /* Global slow path */
     uint32_t cur = order;
-    while (cur <= MAX_ORDER && !global_free_lists[cur]) cur++;
+    while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
+
     if (cur > MAX_ORDER) {
-        pthread_mutex_unlock(&global_lock);
+        pthread_mutex_unlock(&arena->lock);
+
+        /* Fallback: try other arenas */
+        block_header_t *block = NULL;
+        for (int i = 0; i < arena_count; i++) {
+            mbd_arena_t *other_arena = &arenas[i];
+            if (other_arena == arena) continue;
+
+            pthread_mutex_lock(&other_arena->lock);
+            cur = order;
+            while (cur <= MAX_ORDER && !other_arena->free_lists[cur]) cur++;
+
+            if (cur <= MAX_ORDER) {
+                block = other_arena->free_lists[cur];
+                arena_remove(other_arena, block, cur);
+                block = split_block_down(other_arena, block, order);
+                block->used  = 1;
+                block->magic = MAGIC_ALLOC;
+                block->arena = other_arena;
+                block->next = block->prev = NULL;
+                pthread_mutex_unlock(&other_arena->lock);
+                return (void *)((uint8_t*)block + HEADER_SIZE);
+            }
+            pthread_mutex_unlock(&other_arena->lock);
+        }
+
         return NULL;
     }
 
-    block_header_t *block = global_free_lists[cur];
-    global_remove(block, cur);
+    block_header_t *block = arena->free_lists[cur];
+    arena_remove(arena, block, cur);
 
     /* FIXED: Use the safe, non-duplicated helper (eliminates the get_buddy bug) */
-    block = split_block_down(block, order);
+    block = split_block_down(arena, block, order);
 
     block->used  = 1;
     block->magic = MAGIC_ALLOC;
+    block->arena = arena;
     block->next = block->prev = NULL;
 
-    pthread_mutex_unlock(&global_lock);
+    pthread_mutex_unlock(&arena->lock);
     return (void *)((uint8_t*)block + HEADER_SIZE);
 }
 
 /**
  * @brief Frees a previously allocated block of memory.
- * Includes bounds-checking (with underflow protection) and double-free 
- * protection. Small blocks are pushed into the lock-free Thread-Local cache. 
- * If the cache is full, a bulk flush triggers aggressive global Buddy 
+ * Includes bounds-checking (with underflow protection) and double-free
+ * protection. Small blocks are pushed into the lock-free Thread-Local cache.
+ * If the cache is full, a bulk flush triggers aggressive global Buddy
  * coalescing via the safe helper.
- * 
+ *
  * @param ptr Pointer to the memory to free (can be NULL).
  */
 void mbd_free(void *ptr) {
     if (!ptr) return;
 
-    /* Underflow-protected pool bounds check (prevents reading before memory_pool) */
-    if ((uintptr_t)ptr < (uintptr_t)memory_pool + HEADER_SIZE ||
-        (uintptr_t)ptr >= (uintptr_t)memory_pool + POOL_SIZE) {
+    /* Find the arena by checking the pointer against all arena memory pools */
+    mbd_arena_t *arena = NULL;
+    for (int i = 0; i < arena_count; i++) {
+        if ((uintptr_t)ptr >= (uintptr_t)arenas[i].memory_pool + HEADER_SIZE &&
+            (uintptr_t)ptr < (uintptr_t)arenas[i].memory_pool + POOL_SIZE) {
+            arena = &arenas[i];
+            break;
+        }
+    }
+
+    if (!arena) {
         fprintf(stderr, "mbd_free: pointer outside managed pool!\n");
         abort();
     }
@@ -540,14 +632,14 @@ void mbd_free(void *ptr) {
 
     /* Large blocks go straight to global */
     if (order > SMALL_ORDER_MAX) {
-        pthread_mutex_lock(&global_lock);
+        pthread_mutex_lock(&arena->lock);
         block->magic = MAGIC_FREE;
 
         /* Use the safe coalescing helper */
-        order = coalesce_up(block, order);
-        global_insert(order, block);
+        order = coalesce_up(arena, block, order);
+        arena_insert(arena, order, block);
 
-        pthread_mutex_unlock(&global_lock);
+        pthread_mutex_unlock(&arena->lock);
         return;
     }
 
@@ -555,14 +647,14 @@ void mbd_free(void *ptr) {
     thread_cache_data_t *data = get_thread_cache();
     if (!data) {
         fprintf(stderr, "mbd_free: thread cache alloc failed — freeing directly\n");
-        pthread_mutex_lock(&global_lock);
+        pthread_mutex_lock(&arena->lock);
         block->magic = MAGIC_FREE;
 
         /* Use the safe coalescing helper */
-        order = coalesce_up(block, order);
-        global_insert(order, block);
+        order = coalesce_up(arena, block, order);
+        arena_insert(arena, order, block);
 
-        pthread_mutex_unlock(&global_lock);
+        pthread_mutex_unlock(&arena->lock);
         return;
     }
 
@@ -575,7 +667,8 @@ void mbd_free(void *ptr) {
     }
 
     /* Bulk flush (50% of cache) */
-    pthread_mutex_lock(&global_lock);
+    mbd_arena_t *data_arena = data->arena;
+    pthread_mutex_lock(&data_arena->lock);
     int flush_count = THREAD_CACHE_SIZE / 2;
     while (flush_count-- > 0 && data->cache[order]) {
         block_header_t *to_global = data->cache[order];
@@ -586,10 +679,10 @@ void mbd_free(void *ptr) {
 
         /* Use the safe coalescing helper */
         uint32_t o = to_global->order;
-        o = coalesce_up(to_global, o);
-        global_insert(o, to_global);
+        o = coalesce_up(data_arena, to_global, o);
+        arena_insert(data_arena, o, to_global);
     }
-    pthread_mutex_unlock(&global_lock);
+    pthread_mutex_unlock(&data_arena->lock);
 
     /* Now cache the current block */
     block->magic = MAGIC_CACHED;
@@ -617,9 +710,17 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return NULL;
     }
 
+    mbd_arena_t *arena = NULL;
+    for (int i = 0; i < arena_count; i++) {
+        if ((uintptr_t)ptr >= (uintptr_t)arenas[i].memory_pool + HEADER_SIZE &&
+            (uintptr_t)ptr < (uintptr_t)arenas[i].memory_pool + POOL_SIZE) {
+            arena = &arenas[i];
+            break;
+        }
+    }
+
     /* Underflow-protected bounds check */
-    if ((uintptr_t)ptr < (uintptr_t)memory_pool + HEADER_SIZE ||
-        (uintptr_t)ptr >= (uintptr_t)memory_pool + POOL_SIZE) {
+    if (!arena) {
         fprintf(stderr, "mbd_realloc: pointer outside managed pool!\n");
         abort();
     }
@@ -669,9 +770,17 @@ void *mbd_calloc(size_t nmemb, size_t size) {
 size_t mbd_malloc_usable_size(const void *ptr) {
     if (!ptr) return 0;
 
+    mbd_arena_t *arena = NULL;
+    for (int i = 0; i < arena_count; i++) {
+        if ((uintptr_t)ptr >= (uintptr_t)arenas[i].memory_pool + HEADER_SIZE &&
+            (uintptr_t)ptr < (uintptr_t)arenas[i].memory_pool + POOL_SIZE) {
+            arena = &arenas[i];
+            break;
+        }
+    }
+
     /* Underflow-protected bounds check */
-    if ((uintptr_t)ptr < (uintptr_t)memory_pool + HEADER_SIZE ||
-        (uintptr_t)ptr >= (uintptr_t)memory_pool + POOL_SIZE) {
+    if (!arena) {
         return 0;
     }
 
@@ -687,15 +796,17 @@ size_t mbd_malloc_usable_size(const void *ptr) {
  * Note: Does not print blocks currently held in thread-local caches.
  */
 void mbd_dump(void) {
-    pthread_mutex_lock(&global_lock);
-    printf("\n=== v16-FINAL Free Lists (1 GiB) ===\n");
-    for (int i = 0; i <= MAX_ORDER; i++) {
-        int count = 0;
-        for (block_header_t *b = global_free_lists[i]; b; b = b->next) count++;
-        if (count) printf("Global Order %2d (%8zu B) : %3d free\n", i, (size_t)1<<i, count);
+    for (int a = 0; a < arena_count; a++) {
+        pthread_mutex_lock(&arenas[a].lock);
+        printf("\n=== Arena %d Free Lists ===\n", a);
+        for (int i = 0; i <= MAX_ORDER; i++) {
+            int count = 0;
+            for (block_header_t *b = arenas[a].free_lists[i]; b; b = b->next) count++;
+            if (count) printf("Order %2d (%8zu B) : %3d free\n", i, (size_t)1<<i, count);
+        }
+        printf("==================================\n\n");
+        pthread_mutex_unlock(&arenas[a].lock);
     }
-    printf("==================================\n\n");
-    pthread_mutex_unlock(&global_lock);
 }
 
 /**

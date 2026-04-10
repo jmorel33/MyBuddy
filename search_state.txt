@@ -1,0 +1,6 @@
+static uint8_t memory_pool[POOL_SIZE] __attribute__((aligned(32)));
+
+static block_header_t *global_free_lists[MAX_ORDER + 1] = {0};
+static pthread_mutex_t global_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_key_t thread_cache_key;
+static pthread_once_t init_once = PTHREAD_ONCE_INIT;

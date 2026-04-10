@@ -1,0 +1,68 @@
+/* ================================================================== *
+ *                       ARENA LIST OPERATIONS                        *
+ * ================================================================== */
+
+static void arena_insert(mbd_arena_t *arena, uint32_t order, block_header_t *block) {
+    block->prev = NULL;
+    block->next = arena->free_lists[order];
+    if (arena->free_lists[order]) arena->free_lists[order]->prev = block;
+    arena->free_lists[order] = block;
+    block->arena = arena;
+}
+
+static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
+    if (block->prev) block->prev->next = block->next;
+    else             arena->free_lists[order] = block->next;
+    if (block->next) block->next->prev = block->prev;
+    block->prev = block->next = NULL;
+}
+
+/* ================================================================== *
+ *                       HELPER FUNCTIONS                             *
+ * ================================================================== */
+
+static inline uint32_t next_power_of_two(size_t req) {
+    if (req <= MIN_BLOCK) return MIN_BLOCK;
+    req--;
+    req |= req >> 1; req |= req >> 2; req |= req >> 4;
+    req |= req >> 8; req |= req >> 16;
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL
+    req |= req >> 32;
+#endif
+    return (uint32_t)(req + 1);
+}
+
+static inline block_header_t *get_buddy(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
+    uintptr_t offset = (uintptr_t)block - (uintptr_t)arena->memory_pool;
+    if (offset & ((1ULL << order) - 1)) return NULL;
+    uintptr_t buddy_offset = offset ^ (1ULL << order);
+    if (buddy_offset >= POOL_SIZE) return NULL;
+    return (block_header_t *)(arena->memory_pool + buddy_offset);
+}
+
+static block_header_t* split_block_down(mbd_arena_t *arena, block_header_t *block, uint32_t target_order) {
+    while (block->order > target_order) {
+        uint32_t new_order = block->order - 1;
+        block_header_t *buddy = get_buddy(arena, block, new_order);
+        buddy->order = new_order;
+        buddy->used  = 0;
+        buddy->magic = MAGIC_FREE;
+        buddy->arena = arena;
+        buddy->next = buddy->prev = NULL;
+        arena_insert(arena, new_order, buddy);
+        block->order = new_order;
+    }
+    return block;
+}
+
+static uint32_t coalesce_up(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
+    while (order < MAX_ORDER) {
+        block_header_t *buddy = get_buddy(arena, block, order);
+        if (!buddy || buddy->magic != MAGIC_FREE || buddy->order != order || buddy->arena != arena) break;
+        arena_remove(arena, buddy, order);
+        if ((uintptr_t)block > (uintptr_t)buddy) block = buddy;
+        block->order = order + 1;
+        order++;
+    }
+    return order;
+}
