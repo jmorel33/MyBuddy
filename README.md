@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="MyBuddy.jpg" alt="K-Term Logo" width="933">
+  <img src="MyBuddy.jpg" alt="K-Term Logo" width="1024">
 </div>
 
 **High-performance lock-free thread-caching buddy allocator for C/C++.**
