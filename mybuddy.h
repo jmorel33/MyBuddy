@@ -180,22 +180,21 @@ static void global_remove(block_header_t *block, uint32_t order) {
  * ================================================================== */
 
 /**
- * @brief Rounds up a requested size to the nearest power of two.
- * Uses a standard bit-twiddling algorithm. Includes a fallback for 64-bit 
- * integers if compiled on a 64-bit architecture.
- * 
- * @param req The requested memory size in bytes.
- * @return uint32_t The nearest power of two >= req (minimum MIN_BLOCK).
+ * @brief Calculates the block order (log2 of size) for a requested allocation.
+ * Uses hardware fast-paths (clz/bsr) instead of slow loops to find the required
+ * block size order. Maps directly from byte size to order.
+ *
+ * @param needed The requested memory size in bytes (including headers).
+ * @return uint32_t The required order index (minimum 5, representing MIN_BLOCK).
  */
-static inline uint32_t next_power_of_two(size_t req) {
-    if (req <= MIN_BLOCK) return MIN_BLOCK;
-    req--;
-    req |= req >> 1; req |= req >> 2; req |= req >> 4;
-    req |= req >> 8; req |= req >> 16;
+static inline uint32_t get_order(size_t needed) {
+    if (needed <= MIN_BLOCK) return 5; /* 2^5 = 32 */
+    size_t req = needed - 1;
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL
-    req |= req >> 32;
+    return 64 - __builtin_clzll(req);
+#else
+    return 32 - __builtin_clz(req);
 #endif
-    return (uint32_t)(req + 1);
 }
 
 /**
@@ -340,9 +339,7 @@ static thread_cache_data_t *get_thread_cache(void) {
         pthread_mutex_lock(&global_lock);
 
         uint32_t needed = (uint32_t)sizeof(thread_cache_data_t) + HEADER_SIZE;
-        uint32_t order  = 0;
-        uint32_t size   = next_power_of_two(needed);
-        while ((1U << order) < size) order++;
+        uint32_t order  = get_order(needed);
 
         uint32_t cur = order;
         while (cur <= MAX_ORDER && !global_free_lists[cur]) cur++;
@@ -456,9 +453,7 @@ void *mbd_alloc(size_t requested_size) {
     if (!data) return NULL;
 
     size_t needed = requested_size + HEADER_SIZE;
-    uint32_t order = 0;
-    uint32_t size  = next_power_of_two(needed);
-    while ((1U << order) < size) order++;
+    uint32_t order = get_order(needed);
 
     /* HOT PATH — lock-free */
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
