@@ -13,18 +13,26 @@ The current architecture uses a single global lock (`global_lock`) and a single 
 *   **Thread-to-Arena Mapping:** Don't overthink it initially. Start with a simple `arena = arenas[thread_id % arena_count];`. Explicitly define the strategy as `arena_count = 2 * number_of_cores` as a practical default (1x causes burst contention, 4x yields diminishing returns).
 *   **Arena-Local Caches:** The `thread_cache_data_t` TLS cache MUST be bound strictly to ONE arena with no mixing. Store the arena pointer explicitly inside the `thread_cache_data_t` struct upon initialization to prevent recomputation and drift bugs. This completely avoids reintroducing indirect cross-arena traffic.
 *   **Refactoring:** Update `global_insert`, `global_remove`, `coalesce_up`, and `split_block_down` to accept a pointer to the relevant `mbd_arena_t` instead of accessing global variables directly.
-*   **Cross-Arena Frees (Crucial):** Do not rely on offset math or page headers. Instead, add an explicit arena pointer to the header:
+*   **Cross-Arena Frees & Remote Queues (Crucial):** Do not rely on offset math or page headers. Add an explicit arena pointer to the header. Furthermore, to prevent cross-core lock contention during foreign frees (e.g., producer/consumer patterns), introduce a lock-free `remote_free_queue` per arena.
     ```c
     typedef struct block_header {
-        uint32_t order;
-        uint32_t used;
-        uint32_t magic;
+        uint8_t order;             // Shrunk to 1 byte
+        uint32_t magic;            // Encode 'used' and 'cached' flags here
         struct mbd_arena *arena;   // ← KEY ADDITION (8 bytes)
         struct block_header *next;
         struct block_header *prev;
     } block_header_t;
+
+    typedef struct mbd_arena {
+        pthread_mutex_t lock;
+        block_header_t *free_lists[MAX_ORDER + 1];
+        _Atomic(block_header_t*) remote_free_queue; // Lock-free push, lock-drain
+        size_t committed;
+        size_t reserved;
+    } mbd_arena_t;
     ```
-    This guarantees O(1) arena lookup on free, eliminates range scanning, simplifies NUMA, and avoids complex page table tricks.
+    This guarantees O(1) arena lookup on free, eliminates range scanning, and avoids cross-thread locking on free by allowing the owning arena to drain the queue when it locks naturally.
+*   **Explicit Arena Growth Policy:** Arenas should grow independently (not share a global virtual space). Each arena must own its own `mmap` regions, grow in chunked sizes (e.g., 2MB-64MB), and independently track its `committed` and `reserved` capacities to avoid hidden NUMA coupling.
 
 ## 2. NUMA Awareness
 
@@ -48,6 +56,7 @@ While the buddy system guarantees mathematical bounds on fragmentation, "long-li
 *   **Fragmentation Metrics:** Track the distribution of free blocks. Compare the total free memory to the largest contiguous free block available. Crucially, track a per-order histogram, as buddy systems behave in orders, making a lack of specific mid-tier orders a strong signal for fragmentation.
 *   **Segregation via Extended API:** Do not force separate arenas immediately. Instead, introduce an extended API like `mbd_alloc_ex(size, flags)`. Internally route flagged allocations to dedicated arenas. This preserves the clean standard API while providing a gradual evolution path.
 *   **Aggressive Coalescing/Trim:** While `thread_cache_destructor` currently flushes all blocks, long-running threads might accumulate unused cache capacity. Introduce a periodic heuristic (or a user-callable `mbd_trim()`) that forcefully flushes thread caches to global lists, maximizing the chances of `coalesce_up` succeeding.
+*   **Cache Decay / Aging:** Add a time-based or allocation-count based decay mechanism (e.g., `if (unlikely(op_counter % DECAY_INTERVAL == 0)) flush_some_cache(data)`) to proactively flush unused capacity from long-lived threads, significantly improving long-term memory quality.
 *   **Constrained OS Page Release:** For dynamic pools (via `mmap`), use `madvise(..., MADV_DONTNEED)` to return physical RAM to the OS while keeping the virtual address space intact. However, strictly constrain this release to `order >= PAGE_ORDER + 1` to avoid constant page churn.
 
 ## 4. Profiling & Telemetry Hooks
@@ -81,7 +90,12 @@ Adding telemetry is straightforward but must be done carefully to avoid introduc
     #endif
     ```
 
-## 5. Implementation Roadmap
+## 5. Micro-Optimizations (Optional)
+*   **Shrink Header:** Store `order` in a single `uint8_t` (since MAX_ORDER is typically 30).
+*   **Encode Flags:** Encode `used` or `cached` states into the `magic` value (e.g., `MAGIC_ALLOC | FLAG_CACHED`) to shrink the header further and improve cache density.
+*   **O(1) Order Lookup:** Replace the `while ((1U << order) < size)` loop with compiler intrinsics like `__builtin_clz()` or a precomputed lookup table to eliminate looping branches on the fast path.
+
+## 6. Implementation Roadmap
 
 To successfully implement these architectural shifts without destabilizing the current deterministic buddy core, follow this phased approach:
 
