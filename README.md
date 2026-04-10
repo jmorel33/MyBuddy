@@ -1,4 +1,6 @@
-# MyBuddy
+<div align="center">
+  <img src="MyBuddy.jpg" alt="K-Term Logo" width="933">
+</div>
 
 **High-performance lock-free thread-caching buddy allocator for C/C++.**
 
