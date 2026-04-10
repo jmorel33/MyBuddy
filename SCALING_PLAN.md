@@ -99,8 +99,26 @@ Adding telemetry is straightforward but must be done carefully to avoid introduc
 
 To successfully implement these architectural shifts without destabilizing the current deterministic buddy core, follow this phased approach:
 
-*   **Phase 1 (Core Scalability):** Introduce `mbd_arena_t`, per-arena locks, add the `arena` pointer into `block_header_t`, and bind TLS caches to a single arena.
-*   **Phase 2 (Correctness + Structure):** Refactor internal helpers to be arena-aware. Implement O(1) cross-arena frees via the header pointer.
-*   **Phase 3 (Observability):** Introduce `mbd_stats_t`, atomic/TLS counters, and the event hook system with zero-overhead wrappers.
-*   **Phase 4 (Memory Behavior):** Build out the fragmentation metrics (per-order histograms), implement `mbd_trim()`, and constrain OS page release logic (`madvise`).
-*   **Phase 5 (Advanced Scaling):** Implement NUMA-aware arenas, chunked local memory growth, and the remote fallback stealing policy.
+*   **Phase 1 (Core Scalability):**
+    *   Introduce `mbd_arena_t` struct to encapsulate global state.
+    *   Replace `global_lock` with per-arena locks (`pthread_mutex_t lock`).
+    *   Add the `arena` pointer into `block_header_t` to allow O(1) arena lookup.
+    *   Bind TLS caches (`thread_cache_data_t`) strictly to a single arena.
+*   **Phase 2 (Correctness + Structure):**
+    *   Refactor internal helpers to be arena-aware instead of using global variables.
+    *   Implement O(1) cross-arena frees via the `arena` header pointer.
+    *   Introduce a lock-free `remote_free_queue` per arena for safe, cross-core foreign frees.
+*   **Phase 3 (Observability):**
+    *   Define `mbd_stats_t` for observability metrics (e.g., total bytes, cache hits/misses, lock contention).
+    *   Use atomic/TLS counters for tracking metrics without lock overhead.
+    *   Create an optional event hook system with the `mbd_event_type_t` enum (ALLOC, FREE, SPLIT, COALESCE, FLUSH).
+    *   Wrap event hooks in zero-overhead `__builtin_expect` statements.
+*   **Phase 4 (Memory Behavior):**
+    *   Build out fragmentation metrics by tracking per-order histograms.
+    *   Implement `mbd_trim()` to forcefully flush unused cache capacity from long-lived threads.
+    *   Constrain OS page release logic (`madvise` with `MADV_DONTNEED`) strictly to `order >= PAGE_ORDER + 1` to prevent constant page churn.
+*   **Phase 5 (Advanced Scaling):**
+    *   Group `mbd_arena_t` structures by NUMA node.
+    *   Allocate arena memory using NUMA APIs (e.g., `numa_alloc_onnode` or `mmap` combined with `mbind`).
+    *   Add portable thread node detection via a macro like `mbd_get_current_cpu()`.
+    *   Enforce a remote fallback stealing policy: local arena -> local allocate (chunked growth) -> remote steal.
