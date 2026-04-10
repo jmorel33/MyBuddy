@@ -32,24 +32,24 @@
  *
  * @note There is intentionally no `mbd_destroy()` function. Production allocators are designed to live for the entire lifetime of the process.
  * The OS reclaims the memory on exit.
- * 
+ *
  * @example
  * @code
  * #include "mybuddy.h"
- * 
+ *
  * int main() {
  *     // Optional: Pre-warm the allocator before spawning threads
- *     mbd_init(); 
- * 
+ *     mbd_init();
+ *
  *     // Lock-free fast path (falls under SMALL_ORDER_MAX)
  *     char *string_buffer = mbd_alloc(128);
- * 
+ *
  *     // Global slow path (bypasses cache, carves 2MB block)
  *     void *texture_asset = mbd_alloc(1024 * 1024 * 2);
- * 
+ *
  *     mbd_free(string_buffer);
  *     mbd_free(texture_asset);
- * 
+ *
  *     return 0; // OS reclaims memory pool. No leaks.
  * }
  * @endcode
@@ -150,7 +150,7 @@ static const uint32_t MAGIC_CACHED = 0xBAADF00D;
 /**
  * @brief Inserts a block into the global doubly-linked free list.
  * @warning The caller MUST hold `global_lock` before calling this function.
- * 
+ *
  * @param order The power-of-two order (index) of the block.
  * @param block The block to insert.
  */
@@ -164,7 +164,7 @@ static void global_insert(uint32_t order, block_header_t *block) {
 /**
  * @brief Removes a block from the global doubly-linked free list (O(1)).
  * @warning The caller MUST hold `global_lock` before calling this function.
- * 
+ *
  * @param block The block to remove.
  * @param order The power-of-two order (index) of the block.
  */
@@ -180,22 +180,20 @@ static void global_remove(block_header_t *block, uint32_t order) {
  * ================================================================== */
 
 /**
- * @brief Rounds up a requested size to the nearest power of two.
- * Uses a standard bit-twiddling algorithm. Includes a fallback for 64-bit 
- * integers if compiled on a 64-bit architecture.
- * 
+ * @brief Computes the required block order for a requested size.
+ * Leverages compiler intrinsics for fast clz (count leading zeros) instruction.
+ *
  * @param req The requested memory size in bytes.
- * @return uint32_t The nearest power of two >= req (minimum MIN_BLOCK).
+ * @return uint32_t The order of the power-of-two size.
  */
-static inline uint32_t next_power_of_two(size_t req) {
-    if (req <= MIN_BLOCK) return MIN_BLOCK;
+static inline uint32_t size_to_order(size_t req) {
+    if (req <= MIN_BLOCK) return 5;
     req--;
-    req |= req >> 1; req |= req >> 2; req |= req >> 4;
-    req |= req >> 8; req |= req >> 16;
 #if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL
-    req |= req >> 32;
+    return (uint32_t)(64 - __builtin_clzll(req));
+#else
+    return (uint32_t)(32 - __builtin_clz(req));
 #endif
-    return (uint32_t)(req + 1);
 }
 
 /**
@@ -264,10 +262,10 @@ static uint32_t coalesce_up(block_header_t *block, uint32_t order) {
 
 /**
  * @brief POSIX Thread Destructor.
- * Automatically invoked by the OS when a thread terminates. Flushes all 
- * remaining cached blocks to the global pool, then safely frees the cache 
+ * Automatically invoked by the OS when a thread terminates. Flushes all
+ * remaining cached blocks to the global pool, then safely frees the cache
  * struct itself to completely prevent memory leaks.
- * 
+ *
  * @param arg Pointer to the thread's `thread_cache_data_t` struct.
  */
 static void thread_cache_destructor(void *arg) {
@@ -326,9 +324,9 @@ static void internal_init(void) {
 /**
  * @brief Retrieves the Thread-Local cache data.
  * If the thread does not have a cache, one is created. To remain completely
- * independent of the libc standard allocator (for LD_PRELOAD support), 
+ * independent of the libc standard allocator (for LD_PRELOAD support),
  * the cache structure is allocated directly from our own memory pool.
- * 
+ *
  * @return thread_cache_data_t* Pointer to the thread's cache, or NULL on OOM.
  */
 static thread_cache_data_t *get_thread_cache(void) {
@@ -340,9 +338,7 @@ static thread_cache_data_t *get_thread_cache(void) {
         pthread_mutex_lock(&global_lock);
 
         uint32_t needed = (uint32_t)sizeof(thread_cache_data_t) + HEADER_SIZE;
-        uint32_t order  = 0;
-        uint32_t size   = next_power_of_two(needed);
-        while ((1U << order) < size) order++;
+        uint32_t order  = size_to_order(needed);
 
         uint32_t cur = order;
         while (cur <= MAX_ORDER && !global_free_lists[cur]) cur++;
@@ -387,7 +383,7 @@ static thread_cache_data_t *get_thread_cache(void) {
  * @brief Refills a thread's local cache from the global free list.
  * Will split larger blocks if exact-sized blocks are unavailable.
  * @warning The caller MUST hold `global_lock` before calling this function.
- * 
+ *
  * @param data Pointer to the thread's cache struct.
  * @param order The block order (size) to refill.
  */
@@ -424,12 +420,12 @@ static void refill_thread_cache(thread_cache_data_t *data, uint32_t order) {
 
 /**
  * @brief Explicitly initializes the allocator (Optional).
- * 
+ *
  * The allocator is fully self-initializing; it will automatically set itself
  * up on the first call to mbd_alloc(). However, if you want to pre-warm the
- * memory pool and prevent initialization latency on the first allocation, 
+ * memory pool and prevent initialization latency on the first allocation,
  * you can call this function during your application's startup phase.
- * 
+ *
  * This function is thread-safe and idempotent.
  */
 void mbd_init(void) {
@@ -441,7 +437,7 @@ void mbd_init(void) {
  * Tries the lock-free, O(1) Thread-Local Cache fast-path first. If empty
  * or the requested size is large, acquires the global lock and splits
  * blocks via standard Buddy system rules (now using the safe helper).
- * 
+ *
  * @param requested_size The size of memory requested in bytes.
  * @return void* Pointer to the 32-byte aligned payload, or NULL on OOM/error.
  */
@@ -456,9 +452,7 @@ void *mbd_alloc(size_t requested_size) {
     if (!data) return NULL;
 
     size_t needed = requested_size + HEADER_SIZE;
-    uint32_t order = 0;
-    uint32_t size  = next_power_of_two(needed);
-    while ((1U << order) < size) order++;
+    uint32_t order = size_to_order(needed);
 
     /* HOT PATH — lock-free */
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
@@ -511,11 +505,11 @@ void *mbd_alloc(size_t requested_size) {
 
 /**
  * @brief Frees a previously allocated block of memory.
- * Includes bounds-checking (with underflow protection) and double-free 
- * protection. Small blocks are pushed into the lock-free Thread-Local cache. 
- * If the cache is full, a bulk flush triggers aggressive global Buddy 
+ * Includes bounds-checking (with underflow protection) and double-free
+ * protection. Small blocks are pushed into the lock-free Thread-Local cache.
+ * If the cache is full, a bulk flush triggers aggressive global Buddy
  * coalescing via the safe helper.
- * 
+ *
  * @param ptr Pointer to the memory to free (can be NULL).
  */
 void mbd_free(void *ptr) {
