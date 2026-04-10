@@ -8,21 +8,32 @@ This document outlines the feasibility and actionable steps for implementing adv
 The current architecture uses a single global lock (`global_lock`) and a single static memory pool (`memory_pool`). Introducing multiple arenas will significantly reduce lock contention on the slow path (cache misses, bulk flushes, and large allocations) for highly concurrent workloads.
 
 **Actionables:**
-*   **Abstract the Global State:** Encapsulate the global variables (`global_free_lists`, `memory_pool`, `global_lock`) into an `mbd_arena_t` struct.
+*   **Abstract the Global State:** Encapsulate the global variables (`global_free_lists`, `memory_pool`) into an `mbd_arena_t` struct. Drop the single `global_lock` entirely in favor of per-arena locks (`pthread_mutex_t lock` inside `mbd_arena_t`). This alone yields near-linear scaling up to core count for most workloads.
 *   **Arena Array/Dynamic Allocation:** Replace the single static pool with an array of arenas or dynamically allocate arenas via `mmap()`/`VirtualAlloc()` instead of using a `.bss` static array.
-*   **Thread-to-Arena Mapping:** Assign threads to specific arenas. This could be done via a simple hash of the thread ID or round-robin assignment stored in a thread-local variable when the thread's cache is initialized.
+*   **Thread-to-Arena Mapping:** Don't overthink it initially. Start with a simple `arena = arenas[thread_id % arena_count];`.
 *   **Refactoring:** Update `global_insert`, `global_remove`, `coalesce_up`, and `split_block_down` to accept a pointer to the relevant `mbd_arena_t` instead of accessing global variables directly.
-*   **Cross-Arena Frees:** When freeing a block, determine which arena it belongs to (via pointer arithmetic or page headers) to ensure it is returned to the correct arena and lock the appropriate mutex.
+*   **Cross-Arena Frees (Crucial):** Do not rely on offset math or page headers. Instead, add an explicit arena pointer to the header:
+    ```c
+    typedef struct block_header {
+        uint32_t order;
+        uint32_t used;
+        uint32_t magic;
+        struct mbd_arena *arena;   // ← KEY ADDITION (8 bytes)
+        struct block_header *next;
+        struct block_header *prev;
+    } block_header_t;
+    ```
+    This guarantees O(1) arena lookup on free, eliminates range scanning, simplifies NUMA, and avoids complex page table tricks.
 
 ## 2. NUMA Awareness
 
 **Feasibility:** Medium.
-Requires OS-specific APIs (e.g., `libnuma` on Linux, or Windows NUMA APIs). It pairs well with Multi-Arena Scaling by ensuring that threads allocate memory physically close to the CPU they are running on.
+Requires OS-specific APIs (e.g., `libnuma` on Linux, or Windows NUMA APIs). It pairs well with Multi-Arena Scaling by ensuring that threads allocate memory physically close to the CPU they are running on. Importantly, NUMA awareness should only be layered *on top* of the multi-arena foundation.
 
 **Actionables:**
 *   **NUMA-Aware Arenas:** Group the previously designed `mbd_arena_t` structures by NUMA node.
 *   **Memory Allocation:** Instead of a static BSS array, allocate arena memory using NUMA-aware APIs (e.g., `numa_alloc_onnode()` on Linux, or `mmap()` combined with `mbind()` and `MPOL_BIND`).
-*   **Thread Node Detection:** Upon thread initialization (in `get_thread_cache()`), detect the current thread's NUMA node (e.g., using `getcpu()`). Assign the thread to an arena on its local node.
+*   **Thread Node Detection:** Upon thread initialization (in `get_thread_cache()`), detect the current thread's NUMA node. Wrap the detection in a portable macro like `mbd_get_current_cpu()`. On Linux, prefer `sched_getcpu()` over `getcpu()`, and fallback to simple round-robin if unavailable.
 *   **Fallback Mechanism:** If a thread's local NUMA arena runs out of memory, implement a slow-path fallback to steal memory from an arena on a remote NUMA node, or map more memory locally.
 *   **OS Abstraction Layer:** Since NUMA APIs are highly OS-dependent, introduce macro guards (e.g., `#ifdef MBD_USE_NUMA`) and an abstraction layer to keep the library portable.
 
