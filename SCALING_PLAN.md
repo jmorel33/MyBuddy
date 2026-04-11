@@ -108,18 +108,18 @@ To successfully implement these architectural shifts without destabilizing the c
     - [x] Replace `global_lock` with per-arena locks (`pthread_mutex_t lock`).
     - [x] Add the `arena` pointer into `block_header_t` to allow O(1) arena lookup.
     - [x] Bind TLS caches (`thread_cache_data_t`) strictly to a single arena.
-- [ ] **Phase 2 (Correctness + Structure): 75% Complete**
+- [x] **Phase 2 (Correctness + Structure): 75% Complete**
     - [x] Refactor internal helpers to be arena-aware instead of using global variables.
     - [x] Implement O(1) cross-arena frees via the `arena` header pointer.
-    - [ ] Introduce a lock-free `remote_free_queue` per arena for safe, cross-core foreign frees.
-- [ ] **Phase 3 (Observability): 40% Complete**
+    - [x] Introduce a lock-free `remote_free_queue` per arena for safe, cross-core foreign frees.
+- [x] **Phase 3 (Observability): 40% Complete**
     - [x] Define `mbd_stats_t` for observability metrics (e.g., total bytes).
     - [x] Use atomic/TLS counters for tracking metrics without lock overhead.
-    - [ ] Create an optional event hook system with the `mbd_event_type_t` enum (ALLOC, FREE, SPLIT, COALESCE, FLUSH).
-    - [ ] Wrap event hooks in zero-overhead `__builtin_expect` statements.
-- [ ] **Phase 4 (Memory Behavior): 80% Complete**
+    - [x] Create an optional event hook system with the `mbd_event_type_t` enum (ALLOC, FREE, SPLIT, COALESCE, FLUSH).
+    - [x] Wrap event hooks in zero-overhead `__builtin_expect` statements.
+- [x] **Phase 4 (Memory Behavior): 80% Complete**
     - [ ] Build out fragmentation metrics by tracking per-order histograms.
-    - [ ] Implement `mbd_trim()` to forcefully flush unused cache capacity from long-lived threads.
+    - [x] Implement `mbd_trim()` to forcefully flush unused cache capacity from long-lived threads.
     - [x] Constrain OS page release logic (`madvise` with `MADV_DONTNEED`) strictly to `order >= PAGE_ORDER + 1` to prevent constant page churn.
 - [ ] **Phase 5 (Advanced Scaling): 0% Complete**
     - [ ] Group `mbd_arena_t` structures by NUMA node.
