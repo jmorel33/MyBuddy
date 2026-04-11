@@ -78,15 +78,87 @@ extern "C" {
 #define THREAD_CACHE_SIZE  64
 
 /* ── Public API ───────────────────────────────────────────────────── */
+
+/**
+ * @brief Explicitly initializes the allocator (Optional).
+ *
+ * The allocator is fully self-initializing; it will automatically set itself
+ * up on the first call to mbd_alloc(). However, if you want to pre-warm the
+ * memory pool and prevent initialization latency on the first allocation,
+ * you can call this function during your application's startup phase.
+ *
+ * This function is thread-safe and idempotent.
+ */
 void  mbd_init(void);
+
+/**
+ * @brief Destroys the allocator and unmaps all arenas.
+ * Strictly for unit-testing and clean process teardown.
+ */
 void  mbd_destroy(void);
 
+/**
+ * @brief Allocates a block of memory of the specified size.
+ * Tries the lock-free, O(1) Thread-Local Cache fast-path first. If empty
+ * or the requested size is large, acquires the global lock and splits
+ * blocks via standard Buddy system rules.
+ *
+ * @param requested_size The size of memory requested in bytes.
+ * @return void* Pointer to the 32-byte aligned payload, or NULL on OOM/error.
+ */
 void *mbd_alloc(size_t requested_size);
+
+/**
+ * @brief Frees a previously allocated block of memory.
+ * Includes bounds-checking (with underflow protection) and double-free
+ * protection. Small blocks are pushed into the lock-free Thread-Local cache.
+ * If the cache is full, a bulk flush triggers aggressive global Buddy
+ * coalescing.
+ *
+ * @param ptr Pointer to the memory to free (can be NULL).
+ */
 void  mbd_free(void *ptr);
+
+/**
+ * @brief Reallocates a memory block to a new size.
+ *        - If ptr is NULL → behaves like mbd_alloc()
+ *        - If new_size is 0 → frees the block and returns NULL
+ *        - If the new size fits inside the existing block, returns the
+ *          same pointer (no copy, no lock).
+ *        - Otherwise allocates a fresh block, copies data, and frees the old one.
+ *
+ * @param ptr      Old pointer (may be NULL).
+ * @param new_size New requested payload size in bytes.
+ * @return void* New pointer, or NULL on failure / zero-size.
+ */
 void *mbd_realloc(void *ptr, size_t new_size);
+
+/**
+ * @brief Allocates memory for an array of nmemb elements of size bytes each
+ *        and initializes all bytes to zero.
+ *
+ * @param nmemb Number of elements.
+ * @param size  Size of each element.
+ * @return void* Pointer to the allocated memory, or NULL on failure / zero-size.
+ */
 void *mbd_calloc(size_t nmemb, size_t size);
+
+/**
+ * @brief Allocates memory with a specific alignment.
+ *
+ * @param alignment The required alignment (must be a power of two).
+ * @param size      The size of memory requested in bytes.
+ * @return void* Pointer to the aligned payload, or NULL on failure.
+ */
 void *mbd_memalign(size_t alignment, size_t size);
 
+/**
+ * @brief Returns the number of bytes actually usable in an allocated block.
+ *        (Useful for string buffers, growing vectors, etc.)
+ *
+ * @param ptr Allocated pointer (must be valid).
+ * @return size_t Usable payload size (≥ requested size).
+ */
 size_t mbd_malloc_usable_size(const void *ptr);
 
 typedef struct {
@@ -95,8 +167,25 @@ typedef struct {
     size_t total_free_bytes;
 } mbd_stats_t;
 
+/**
+ * @brief Returns accurate diagnostics of mapped, allocated, and free bytes.
+ *
+ * @return mbd_stats_t Diagnostics information.
+ */
 mbd_stats_t mbd_get_stats(void);
+
+/**
+ * @brief Sets a custom Out-Of-Memory handler hook.
+ *
+ * @param handler Function pointer to the handler.
+ */
 void mbd_set_oom_handler(void (*handler)(void));
+
+/**
+ * @brief Diagnostics Utility.
+ * Prints the current state of the global free lists to stdout.
+ * Note: Does not print blocks currently held in thread-local caches.
+ */
 void mbd_dump(void);
 
 /* ── String Helpers ───────────────────────────────────────────────── */
@@ -108,18 +197,29 @@ typedef struct {
 /**
  * @brief Create a string view from a classic null-terminated C string.
  *        The view does **not** allocate or copy data.
+ *
+ * @param s A null-terminated C string.
+ * @return mbd_string_view_t A string view struct pointing to the data.
  */
 mbd_string_view_t mbd_string_view_from_cstr(const char *s);
 
 /**
  * @brief Create a string view from raw data + exact length.
  *        ie. binary data, network buffers, or when you know the length.
+ *        The view does **not** allocate or copy data.
+ *
+ * @param data Raw byte data.
+ * @param len  Exact length in bytes.
+ * @return mbd_string_view_t A string view struct pointing to the data.
  */
 mbd_string_view_t mbd_string_view_from_data(const char *data, size_t len);
 
 /**
  * @brief Allocate a null-terminated C string copy from a string view
  *        (uses mbd_alloc internally). Useful for classic C string.
+ *
+ * @param view The string view to duplicate.
+ * @return char* A newly allocated, null-terminated C string, or NULL on failure.
  */
 char *mbd_string_view_dup(mbd_string_view_t view);
 
@@ -526,16 +626,6 @@ static void refill_thread_cache(thread_cache_data_t *data, uint32_t order) {
  *                       PUBLIC API                                   *
  * ================================================================== */
 
-/**
- * @brief Explicitly initializes the allocator (Optional).
- * 
- * The allocator is fully self-initializing; it will automatically set itself
- * up on the first call to mbd_alloc(). However, if you want to pre-warm the
- * memory pool and prevent initialization latency on the first allocation, 
- * you can call this function during your application's startup phase.
- * 
- * This function is thread-safe and idempotent.
- */
 void mbd_init(void) {
     pthread_once(&init_once, internal_init);
 }
@@ -563,15 +653,6 @@ void mbd_set_oom_handler(void (*handler)(void)) {
     global_oom_handler = handler;
 }
 
-/**
- * @brief Allocates a block of memory of the specified size.
- * Tries the lock-free, O(1) Thread-Local Cache fast-path first. If empty
- * or the requested size is large, acquires the global lock and splits
- * blocks via standard Buddy system rules (now using the safe helper).
- * 
- * @param requested_size The size of memory requested in bytes.
- * @return void* Pointer to the 32-byte aligned payload, or NULL on OOM/error.
- */
 void *mbd_alloc(size_t requested_size) {
     if (requested_size == 0) return NULL;
     size_t needed = requested_size + HEADER_SIZE;
@@ -682,15 +763,6 @@ void *mbd_alloc(size_t requested_size) {
     return (void *)((uint8_t*)block + HEADER_SIZE);
 }
 
-/**
- * @brief Frees a previously allocated block of memory.
- * Includes bounds-checking (with underflow protection) and double-free 
- * protection. Small blocks are pushed into the lock-free Thread-Local cache. 
- * If the cache is full, a bulk flush triggers aggressive global Buddy 
- * coalescing via the safe helper.
- * 
- * @param ptr Pointer to the memory to free (can be NULL).
- */
 void mbd_free(void *ptr) {
     if (!ptr) return;
 
@@ -794,18 +866,6 @@ void mbd_free(void *ptr) {
     atomic_fetch_add(&global_cached_bytes, 1ULL << order);
 }
 
-/**
- * @brief Reallocates a memory block to a new size.
- *        - If ptr is NULL → behaves like mbd_alloc()
- *        - If new_size is 0 → frees the block and returns NULL
- *        - If the new size fits inside the existing block, returns the
- *          same pointer (no copy, no lock).
- *        - Otherwise allocates a fresh block, copies data, and frees the old one.
- *
- * @param ptr      Old pointer (may be NULL)
- * @param new_size New requested payload size in bytes
- * @return void* New pointer, or NULL on failure / zero-size
- */
 void *mbd_realloc(void *ptr, size_t new_size) {
     if (!ptr) return mbd_alloc(new_size);
     if (new_size == 0) { mbd_free(ptr); return NULL; }
@@ -852,10 +912,6 @@ void *mbd_realloc(void *ptr, size_t new_size) {
     return new_ptr;
 }
 
-/**
- * @brief Allocates memory for an array of nmemb elements of size bytes each
- *        and initializes all bytes to zero.
- */
 void *mbd_calloc(size_t nmemb, size_t size) {
     if (size != 0 && nmemb > SIZE_MAX / size) return NULL;
     size_t total = nmemb * size;
@@ -886,13 +942,6 @@ void *mbd_memalign(size_t alignment, size_t size) {
     return (void *)aligned_addr;
 }
 
-/**
- * @brief Returns the number of bytes actually usable in an allocated block.
- *        (Useful for string buffers, growing vectors, etc.)
- *
- * @param ptr Allocated pointer (must be valid)
- * @return size_t Usable payload size (≥ requested size)
- */
 size_t mbd_malloc_usable_size(const void *ptr) {
     if (!ptr) return 0;
 
@@ -932,11 +981,6 @@ mbd_stats_t mbd_get_stats(void) {
     return s;
 }
 
-/**
- * @brief Diagnostics Utility.
- * Prints the current state of the global free lists to stdout.
- * Note: Does not print blocks currently held in thread-local caches.
- */
 void mbd_dump(void) {
     for (int a = 0; a < arena_count; a++) {
         pthread_mutex_lock(&arenas[a].lock);
@@ -955,27 +999,15 @@ void mbd_dump(void) {
  *                       STRING HELPERS                               *
  * ================================================================== */
  
-/**
- * @brief Create a string view from a classic null-terminated C string.
- *        The view does **not** allocate or copy data.
- */
 mbd_string_view_t mbd_string_view_from_cstr(const char *s) {
     if (!s) return (mbd_string_view_t){NULL, 0};
     return (mbd_string_view_t){s, strlen(s)};
 }
 
-/**
- * @brief Create a string view from raw data + exact length.
- *        The view does **not** allocate or copy data.
- */
 mbd_string_view_t mbd_string_view_from_data(const char *data, size_t len) {
     return (mbd_string_view_t){data, len};
 }
 
-/**
- * @brief Allocate a null-terminated C string copy from a string view
- *        (uses mbd_alloc internally).
- */
 char *mbd_string_view_dup(mbd_string_view_t view) {
     if (!view.data || view.len == 0) return NULL;
 
