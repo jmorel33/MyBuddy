@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.3
+ * @version 1.3.1
  * @date April 11, 2026
  * @author Jacques Morel
  *
@@ -203,6 +203,10 @@ void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t));
 
 /**
  * @brief Forces a trim of all thread caches, returning memory to the global arena.
+ * @note **Heavy Operation**: This triggers a cooperative trim where every thread will
+ *       completely flush its local cache on its next allocation or free. This causes a
+ *       100% cache miss rate immediately following the trim. Use only for low memory
+ *       emergencies, not for periodic lightweight usage.
  */
 void mbd_trim(void);
 
@@ -307,10 +311,11 @@ typedef struct block_header {
 
 typedef struct mbd_arena {
     pthread_mutex_t lock;
+    pthread_mutex_t remote_lock;
     block_header_t *free_lists[MAX_ORDER + 1];
     uint8_t *memory_pool;
     struct {
-        _Atomic(block_header_t*) head;
+        block_header_t *head;
     } remote_free_queue;
 } mbd_arena_t;
 
@@ -328,6 +333,7 @@ typedef struct thread_cache_data {
     uint64_t        cache_hits;
     uint64_t        cache_misses;
     uint64_t        bulk_flushes;
+    int             last_trim_request;
     struct thread_cache_data *next;
 } __attribute__((aligned(64))) thread_cache_data_t;
 
@@ -342,6 +348,7 @@ static long os_page_size = 4096;
 static _Atomic size_t global_cached_bytes = 0;
 static pthread_mutex_t cache_list_lock = PTHREAD_MUTEX_INITIALIZER;
 static thread_cache_data_t *global_cache_list = NULL;
+static _Atomic int trim_requested = 0;
 
 static pthread_key_t thread_cache_key;
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
@@ -455,7 +462,10 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     return block;
 }
 static void drain_remote_queue(mbd_arena_t *arena) {
-    block_header_t *head = atomic_exchange_explicit(&arena->remote_free_queue.head, NULL, memory_order_acquire);
+    pthread_mutex_lock(&arena->remote_lock);
+    block_header_t *head = arena->remote_free_queue.head;
+    arena->remote_free_queue.head = NULL;
+    pthread_mutex_unlock(&arena->remote_lock);
     while (head) {
         block_header_t *next = head->next;
         head->magic = MAGIC_FREE;
@@ -568,6 +578,8 @@ static void internal_init(void) {
 
     for (int a = 0; a < arena_count; a++) {
         pthread_mutex_init(&arenas[a].lock, NULL);
+        pthread_mutex_init(&arenas[a].remote_lock, NULL);
+        arenas[a].remote_free_queue.head = NULL;
         for (int i = 0; i <= MAX_ORDER; i++) arenas[a].free_lists[i] = NULL;
         
         arenas[a].memory_pool = (uint8_t *)mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
@@ -595,6 +607,7 @@ static void internal_init(void) {
  * 
  * @return thread_cache_data_t* Pointer to the thread's cache, or NULL on OOM.
  */
+static void flush_my_cache(thread_cache_data_t *curr);
 static thread_cache_data_t *get_thread_cache(void) {
     pthread_once(&init_once, internal_init);
 
@@ -781,6 +794,7 @@ void mbd_destroy(void) {
             arenas[a].memory_pool = NULL;
         }
         pthread_mutex_destroy(&arenas[a].lock);
+        pthread_mutex_destroy(&arenas[a].remote_lock);
     }
     pthread_key_delete(thread_cache_key);
 }
@@ -837,17 +851,16 @@ void *mbd_alloc(size_t requested_size) {
 
     thread_cache_data_t *data = get_thread_cache();
     if (!data) { handle_oom(); return NULL; }
+    if (__builtin_expect(atomic_load(&trim_requested) != data->last_trim_request, 0)) {
+        flush_my_cache(data);
+        data->last_trim_request = atomic_load(&trim_requested);
+    }
     mbd_arena_t *arena = data->arena;
 
     uint32_t order = next_power_of_two_order(needed);
 
     /* HOT PATH — lock-free */
 
-    /* Opportunistic drain to prevent remote queue hoarding */
-    if (atomic_load_explicit(&arena->remote_free_queue.head, memory_order_acquire) && pthread_mutex_trylock(&arena->lock) == 0) {
-        drain_remote_queue(arena);
-        pthread_mutex_unlock(&arena->lock);
-    }
 
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
         block_header_t *block = data->cache[order];
@@ -867,6 +880,7 @@ void *mbd_alloc(size_t requested_size) {
     }
 
     pthread_mutex_lock(&arena->lock);
+    drain_remote_queue(arena);
 
     if (order <= SMALL_ORDER_MAX) {
         if (data) data->cache_misses++;
@@ -900,6 +914,7 @@ void *mbd_alloc(size_t requested_size) {
             if (other_arena == arena) continue;
             
             pthread_mutex_lock(&other_arena->lock);
+            drain_remote_queue(other_arena);
             cur = order;
             while (cur <= MAX_ORDER && !other_arena->free_lists[cur]) cur++;
             
@@ -999,14 +1014,18 @@ void mbd_free(void *ptr) {
     }
 
 
-    /* Remote free queue push if we are on foreign thread cache */
     thread_cache_data_t *data = get_thread_cache();
+    if (data && __builtin_expect(atomic_load(&trim_requested) != data->last_trim_request, 0)) {
+        flush_my_cache(data);
+        data->last_trim_request = atomic_load(&trim_requested);
+    }
+
+    /* Remote free queue push if we are on foreign thread cache */
     if (data && block->arena != data->arena) {
-        block_header_t *old_head;
-        do {
-            old_head = atomic_load_explicit(&block->arena->remote_free_queue.head, memory_order_acquire);
-            block->next = old_head;
-        } while (!atomic_compare_exchange_weak_explicit(&block->arena->remote_free_queue.head, &old_head, block, memory_order_release, memory_order_relaxed));
+        pthread_mutex_lock(&block->arena->remote_lock);
+        block->next = block->arena->remote_free_queue.head;
+        block->arena->remote_free_queue.head = block;
+        pthread_mutex_unlock(&block->arena->remote_lock);
         return;
     }
 
@@ -1023,11 +1042,6 @@ void mbd_free(void *ptr) {
     }
 
 
-    /* Opportunistic drain to prevent remote queue hoarding */
-    if (atomic_load_explicit(&arena->remote_free_queue.head, memory_order_acquire) && pthread_mutex_trylock(&arena->lock) == 0) {
-        drain_remote_queue(arena);
-        pthread_mutex_unlock(&arena->lock);
-    }
 
     if (data->count[order] < THREAD_CACHE_SIZE) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << block->order);
@@ -1216,44 +1230,44 @@ size_t mbd_malloc_usable_size(const void *ptr) {
 
 /**
  * @brief Forces a trim of all thread caches, returning memory to the global arena.
+ * @note **Heavy Operation**: This triggers a cooperative trim where every thread will
+ *       completely flush its local cache on its next allocation or free. This causes a
+ *       100% cache miss rate immediately following the trim. Use only for low memory
+ *       emergencies, not for periodic lightweight usage.
  */
-void mbd_trim(void) {
-    pthread_mutex_lock(&cache_list_lock);
-    thread_cache_data_t *curr = global_cache_list;
-    while (curr) {
-        mbd_arena_t *locked_arena = NULL;
-        for (int o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {
-            while (curr->cache[o]) {
-                block_header_t *block = curr->cache[o];
-                curr->cache[o] = block->next;
-                curr->count[o]--;
+static void flush_my_cache(thread_cache_data_t *curr) {
+    mbd_arena_t *locked_arena = NULL;
+    for (int o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {
+        while (curr->cache[o]) {
+            block_header_t *block = curr->cache[o];
+            curr->cache[o] = block->next;
+            curr->count[o]--;
 
-                block->magic = MAGIC_FREE;
+            block->magic = MAGIC_FREE;
 
-                mbd_arena_t *block_arena = block->arena;
+            mbd_arena_t *block_arena = block->arena;
 
-                if (locked_arena != block_arena) {
-                    if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
-                    locked_arena = block_arena;
-                    pthread_mutex_lock(&locked_arena->lock);
-                    drain_remote_queue(locked_arena);
-                }
-
-
-                uint32_t original_order = block->order;
-                uint32_t coalesced_order = original_order;
-                block = coalesce_up_and_update(locked_arena, block, &coalesced_order);
-                arena_insert(locked_arena, coalesced_order, block);
-
-                atomic_fetch_sub(&global_cached_bytes, 1ULL << original_order);
-                atomic_fetch_sub(&global_cache_pressure, 1ULL << original_order);
+            if (locked_arena != block_arena) {
+                if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+                locked_arena = block_arena;
+                pthread_mutex_lock(&locked_arena->lock);
+                drain_remote_queue(locked_arena);
             }
+
+            uint32_t original_order = block->order;
+            uint32_t coalesced_order = original_order;
+            block = coalesce_up_and_update(locked_arena, block, &coalesced_order);
+            arena_insert(locked_arena, coalesced_order, block);
+
+            atomic_fetch_sub(&global_cached_bytes, 1ULL << original_order);
+            atomic_fetch_sub(&global_cache_pressure, 1ULL << original_order);
         }
-        if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
-        curr = curr->next;
     }
-    pthread_mutex_unlock(&cache_list_lock);
-    atomic_store(&global_cache_pressure, 0);
+    if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+}
+
+void mbd_trim(void) {
+    atomic_fetch_add(&trim_requested, 1);
 }
 
 /**
