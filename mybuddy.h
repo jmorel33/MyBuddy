@@ -161,6 +161,9 @@ void *mbd_memalign(size_t alignment, size_t size);
  */
 size_t mbd_malloc_usable_size(const void *ptr);
 
+/**
+ * @brief Allocator statistics.
+ */
 typedef struct {
     size_t total_mapped_bytes;
     size_t total_allocated_bytes;
@@ -180,6 +183,9 @@ typedef struct {
  */
 mbd_stats_t mbd_get_stats(void);
 
+/**
+ * @brief Profiler event types.
+ */
 typedef enum {
     MBD_EVENT_ALLOC,
     MBD_EVENT_FREE,
@@ -194,6 +200,10 @@ typedef enum {
  * @param hook Function pointer to the hook.
  */
 void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t));
+
+/**
+ * @brief Forces a trim of all thread caches, returning memory to the global arena.
+ */
 void mbd_trim(void);
 
 /**
@@ -752,6 +762,10 @@ void mbd_init(void) {
     pthread_once(&init_once, internal_init);
 }
 
+/**
+ * @brief Destroys the allocator and unmaps all arenas.
+ * Strictly for unit-testing and clean process teardown.
+ */
 void mbd_destroy(void) {
     thread_cache_data_t *data = pthread_getspecific(thread_cache_key);
     if (data) {
@@ -771,10 +785,20 @@ void mbd_destroy(void) {
     pthread_key_delete(thread_cache_key);
 }
 
+/**
+ * @brief Sets a custom Out-Of-Memory handler hook.
+ *
+ * @param handler Function pointer to the handler.
+ */
 void mbd_set_oom_handler(void (*handler)(void)) {
     global_oom_handler = handler;
 }
 
+/**
+ * @brief Sets a custom profiler hook.
+ *
+ * @param hook Function pointer to the hook.
+ */
 void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t)) {
     global_profiler_hook = hook;
 }
@@ -1190,6 +1214,9 @@ size_t mbd_malloc_usable_size(const void *ptr) {
 }
 
 
+/**
+ * @brief Forces a trim of all thread caches, returning memory to the global arena.
+ */
 void mbd_trim(void) {
     pthread_mutex_lock(&cache_list_lock);
     thread_cache_data_t *curr = global_cache_list;
@@ -1229,6 +1256,11 @@ void mbd_trim(void) {
     atomic_store(&global_cache_pressure, 0);
 }
 
+/**
+ * @brief Returns accurate diagnostics of mapped, allocated, and free bytes.
+ *
+ * @return mbd_stats_t Diagnostics information.
+ */
 mbd_stats_t mbd_get_stats(void) {
     pthread_once(&init_once, internal_init);
     mbd_stats_t s = {0};

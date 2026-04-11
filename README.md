@@ -28,6 +28,31 @@ MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high
 - **Large objects** (8 KiB – 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
 - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
 
+## Library Lifecycle
+
+```mermaid
+flowchart TD
+    A[Start Application] --> B(mbd_init - Optional)
+    B --> C{First Allocation?}
+    C -- Yes --> D[Auto-Initialize Arenas]
+    C -- No --> E
+    D --> E[Thread Local Cache Request]
+    E --> F{Cache Hit?}
+    F -- Yes --> G[Return Cached Block Fast Path]
+    F -- No --> H[Lock Arena & Refill Cache / Split Buddy Block]
+    H --> I[Return Aligned Block]
+    I --> J[Usage: mbd_realloc, mbd_malloc_usable_size, etc.]
+    G --> J
+    J --> K[mbd_free]
+    K --> L{Cache Full?}
+    L -- Yes --> M[Bulk Flush to Arena & Coalesce]
+    L -- No --> N[Return to Thread Local Cache]
+    M --> O
+    N --> O[Thread Exits / Cache Destroyed]
+    O --> P[Return all blocks to Global Arena]
+    P --> Q[Process Teardown / mbd_destroy]
+```
+
 ## Quick Start
 
 MyBuddy is a single-header library. To use it, you just need to include the header. However, exactly **one** C or C++ file in your project must define `MYBUDDY_IMPLEMENTATION` before including the header to instantiate the implementation.
@@ -89,6 +114,10 @@ int main() {
   Returns accurate diagnostics of mapped, allocated, and free bytes.
 - `void mbd_set_oom_handler(void (*handler)(void));`
   Sets a custom Out-Of-Memory handler hook.
+- `void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t));`
+  Sets a custom profiler hook.
+- `void mbd_trim(void);`
+  Forces a trim of all thread caches, returning memory to the global arena.
 - `void mbd_dump(void);`
   Prints the current state of the global free lists for diagnostics.
 
