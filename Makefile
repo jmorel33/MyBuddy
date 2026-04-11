@@ -1,7 +1,7 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -pthread
 
-TESTS = tests/test_basic tests/test_threads tests/test_huge tests/test_string_view tests/test_usable_size
+TESTS = tests/test_basic tests/test_threads tests/test_huge tests/test_string_view tests/test_usable_size tests/test_multithread_stress
 
 all: $(TESTS)
 
@@ -20,6 +20,9 @@ tests/test_string_view: tests/test_string_view.c mybuddy.h
 tests/test_usable_size: tests/test_usable_size.c mybuddy.h
 	$(CC) $(CFLAGS) $< -o $@
 
+tests/test_multithread_stress: tests/test_multithread_stress.c mybuddy.h
+	$(CC) $(CFLAGS) $< -o $@
+
 test: $(TESTS)
 	@echo "Running basic tests..."
 	@./tests/test_basic
@@ -31,6 +34,8 @@ test: $(TESTS)
 	@./tests/test_string_view
 	@echo "Running usable size tests..."
 	@./tests/test_usable_size
+	@echo "Running multi-thread stress tests..."
+	@./tests/test_multithread_stress
 	@echo "All tests passed successfully!"
 
 clean:
