@@ -420,7 +420,6 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     uint32_t order = *order_out;
     while (order < MAX_ORDER) {
         block_header_t *buddy = get_buddy(arena, block, order);
-        if (buddy)
         if (!buddy || buddy->magic != MAGIC_FREE || buddy->order != order || buddy->arena != arena) break;
         arena_remove(arena, buddy, order);
         atomic_fetch_add(&global_coalesces, 1);
@@ -632,14 +631,14 @@ static thread_cache_data_t *get_thread_cache(void) {
                     
                     data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
                     memset(data, 0, sizeof(thread_cache_data_t));
-                    data->arena = arena;
+                    data->arena = other_arena;
 
-        data->next = NULL;
-        pthread_mutex_lock(&cache_list_lock);
-        data->next = global_cache_list;
-        global_cache_list = data;
-        pthread_mutex_unlock(&cache_list_lock);
- // Affined cache requests to the thread's native arena.
+                    data->next = NULL;
+                    pthread_mutex_lock(&cache_list_lock);
+                    data->next = global_cache_list;
+                    global_cache_list = data;
+                    pthread_mutex_unlock(&cache_list_lock);
+                    // Affined cache requests to the thread's native arena.
                     
                     if (pthread_setspecific(thread_cache_key, data) != 0) {
                         block->used = 0;
@@ -1102,7 +1101,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
     }
 
     if (block->is_mmap && block->magic == MAGIC_MMAP) {
-        size_t old_usable = (size_t)block->prev - HEADER_SIZE;
+        size_t old_usable = block->mmap_size - HEADER_SIZE;
         if (new_size <= old_usable) return ptr;
 
         void *new_ptr = mbd_alloc(new_size);
@@ -1199,11 +1198,6 @@ void mbd_trim(void) {
     while (curr) {
         mbd_arena_t *locked_arena = NULL;
         for (int o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {
-            block_header_t *p = curr->cache[o];
-            while (p) {
-
-                p = p->next;
-            }
             while (curr->cache[o]) {
                 block_header_t *block = curr->cache[o];
                 curr->cache[o] = block->next;
