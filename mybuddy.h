@@ -599,25 +599,17 @@ void *mbd_alloc(size_t requested_size) {
 void mbd_free(void *ptr) {
     if (!ptr) return;
 
-    /* Find the arena by checking the pointer against all arena memory pools */
-    mbd_arena_t *arena = NULL;
-    for (int i = 0; i < arena_count; i++) {
-        if ((uintptr_t)ptr >= (uintptr_t)arenas[i].memory_pool + HEADER_SIZE &&
-            (uintptr_t)ptr < (uintptr_t)arenas[i].memory_pool + POOL_SIZE) {
-            arena = &arenas[i];
-            break;
-        }
-    }
-
-    if (!arena) {
-        fprintf(stderr, "mbd_free: pointer outside managed pool!\n");
-        abort();
-    }
-
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
 
     if (block->magic != MAGIC_ALLOC) {
         fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption!\n");
+        abort();
+    }
+
+    mbd_arena_t *arena = block->arena;
+    if (!arena || (uintptr_t)ptr < (uintptr_t)arena->memory_pool + HEADER_SIZE ||
+        (uintptr_t)ptr >= (uintptr_t)arena->memory_pool + POOL_SIZE) {
+        fprintf(stderr, "mbd_free: pointer outside managed pool!\n");
         abort();
     }
 
@@ -706,24 +698,17 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return NULL;
     }
 
-    mbd_arena_t *arena = NULL;
-    for (int i = 0; i < arena_count; i++) {
-        if ((uintptr_t)ptr >= (uintptr_t)arenas[i].memory_pool + HEADER_SIZE &&
-            (uintptr_t)ptr < (uintptr_t)arenas[i].memory_pool + POOL_SIZE) {
-            arena = &arenas[i];
-            break;
-        }
-    }
-
-    /* Underflow-protected bounds check */
-    if (!arena) {
-        fprintf(stderr, "mbd_realloc: pointer outside managed pool!\n");
-        abort();
-    }
-
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
     if (block->magic != MAGIC_ALLOC) {
         fprintf(stderr, "mbd_realloc: invalid pointer or double-free!\n");
+        abort();
+    }
+
+    mbd_arena_t *arena = block->arena;
+    /* Underflow-protected bounds check */
+    if (!arena || (uintptr_t)ptr < (uintptr_t)arena->memory_pool + HEADER_SIZE ||
+        (uintptr_t)ptr >= (uintptr_t)arena->memory_pool + POOL_SIZE) {
+        fprintf(stderr, "mbd_realloc: pointer outside managed pool!\n");
         abort();
     }
 
@@ -766,22 +751,15 @@ void *mbd_calloc(size_t nmemb, size_t size) {
 size_t mbd_malloc_usable_size(const void *ptr) {
     if (!ptr) return 0;
 
-    mbd_arena_t *arena = NULL;
-    for (int i = 0; i < arena_count; i++) {
-        if ((uintptr_t)ptr >= (uintptr_t)arenas[i].memory_pool + HEADER_SIZE &&
-            (uintptr_t)ptr < (uintptr_t)arenas[i].memory_pool + POOL_SIZE) {
-            arena = &arenas[i];
-            break;
-        }
-    }
-
-    /* Underflow-protected bounds check */
-    if (!arena) {
-        return 0;
-    }
-
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
     if (block->magic != MAGIC_ALLOC) return 0; /* safety */
+
+    mbd_arena_t *arena = block->arena;
+    /* Underflow-protected bounds check */
+    if (!arena || (uintptr_t)ptr < (uintptr_t)arena->memory_pool + HEADER_SIZE ||
+        (uintptr_t)ptr >= (uintptr_t)arena->memory_pool + POOL_SIZE) {
+        return 0;
+    }
 
     return ((size_t)1 << block->order) - HEADER_SIZE;
 }
