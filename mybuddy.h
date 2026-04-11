@@ -244,9 +244,6 @@ static void thread_cache_destructor(void *arg) {
     thread_cache_data_t *data = arg;
     if (!data) return;
 
-    mbd_arena_t *arena = data->arena;
-    pthread_mutex_lock(&arena->lock);
-
     /* Flush all cached blocks */
     for (int o = 0; o <= SMALL_ORDER_MAX; o++) {
         while (data->cache[o]) {
@@ -257,9 +254,14 @@ static void thread_cache_destructor(void *arg) {
             block->magic = MAGIC_FREE;
             uint32_t order = block->order;
 
+            mbd_arena_t *block_arena = block->arena;
+            pthread_mutex_lock(&block_arena->lock);
+
             /* Use the safe coalescing helper */
-            order = coalesce_up(arena, block, order);
-            arena_insert(arena, order, block);
+            order = coalesce_up(block_arena, block, order);
+            arena_insert(block_arena, order, block);
+
+            pthread_mutex_unlock(&block_arena->lock);
         }
     }
 
@@ -269,11 +271,14 @@ static void thread_cache_destructor(void *arg) {
     cache_block->magic = MAGIC_FREE;
     uint32_t co = cache_block->order;
 
-    /* Use the new safe helper */
-    co = coalesce_up(arena, cache_block, co);
-    arena_insert(arena, co, cache_block);
+    mbd_arena_t *cache_arena = cache_block->arena;
+    pthread_mutex_lock(&cache_arena->lock);
 
-    pthread_mutex_unlock(&arena->lock);
+    /* Use the new safe helper */
+    co = coalesce_up(cache_arena, cache_block, co);
+    arena_insert(cache_arena, co, cache_block);
+
+    pthread_mutex_unlock(&cache_arena->lock);
 }
 
 /**
@@ -440,18 +445,7 @@ static void refill_thread_cache(thread_cache_data_t *data, uint32_t order) {
             while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
 
             if (cur > MAX_ORDER) {
-                /* Fallback */
-                int found = 0;
-                for (int i = 0; i < arena_count; i++) {
-                    mbd_arena_t *other_arena = &arenas[i];
-                    if (other_arena == arena) continue;
-
-                    pthread_mutex_lock(&other_arena->lock);
-                    cur = order + 1; // Wait, actually we can satisfy order directly from other arenas, but refill_thread_cache assumes returning from split.
-                    // Instead of full fallback here, just break and let mbd_alloc handle fallback for the current allocation if cache is empty.
-                    // Actually, breaking here is safe, the cache just won't be fully refilled.
-                    pthread_mutex_unlock(&other_arena->lock);
-                }
+                /* Let mbd_alloc handle fallback for the current allocation if cache is empty. */
                 break;
             }
 
@@ -667,8 +661,6 @@ void mbd_free(void *ptr) {
     }
 
     /* Bulk flush (50% of cache) */
-    mbd_arena_t *data_arena = data->arena;
-    pthread_mutex_lock(&data_arena->lock);
     int flush_count = THREAD_CACHE_SIZE / 2;
     while (flush_count-- > 0 && data->cache[order]) {
         block_header_t *to_global = data->cache[order];
@@ -677,12 +669,16 @@ void mbd_free(void *ptr) {
 
         to_global->magic = MAGIC_FREE;
 
+        mbd_arena_t *block_arena = to_global->arena;
+        pthread_mutex_lock(&block_arena->lock);
+
         /* Use the safe coalescing helper */
         uint32_t o = to_global->order;
-        o = coalesce_up(data_arena, to_global, o);
-        arena_insert(data_arena, o, to_global);
+        o = coalesce_up(block_arena, to_global, o);
+        arena_insert(block_arena, o, to_global);
+
+        pthread_mutex_unlock(&block_arena->lock);
     }
-    pthread_mutex_unlock(&data_arena->lock);
 
     /* Now cache the current block */
     block->magic = MAGIC_CACHED;

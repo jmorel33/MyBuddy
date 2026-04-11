@@ -1,5 +1,0 @@
-/* ── Configuration Macros ─────────────────────────────────────────── */
-#define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
-#define MAX_ORDER          27
-#define SMALL_ORDER_MAX    13             // includes 4 KiB pages
-#define THREAD_CACHE_SIZE  64
