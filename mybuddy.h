@@ -233,13 +233,10 @@ static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t ord
  * ================================================================== */
 
 static inline uint32_t next_power_of_two_order(size_t req) {
-    uint32_t order = MIN_ORDER;
-    size_t size = 1ULL << MIN_ORDER;
-    while (size < req) {
-        order++;
-        size <<= 1;
+    if (req <= (1ULL << MIN_ORDER)) {
+        return MIN_ORDER;
     }
-    return order;
+    return 64 - __builtin_clzll(req - 1);
 }
 
 static inline block_header_t *get_buddy(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
