@@ -73,7 +73,7 @@ extern "C" {
 /* ── Configuration Macros ─────────────────────────────────────────── */
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
-#define MIN_ORDER          5              // 32 bytes minimum block size
+#define MIN_ORDER          4              // 16 bytes minimum block size
 #define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 #define THREAD_CACHE_SIZE  64
 
@@ -445,7 +445,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     return block;
 }
 static void drain_remote_queue(mbd_arena_t *arena) {
-    block_header_t *head = atomic_exchange(&arena->remote_free_queue.head, NULL);
+    block_header_t *head = atomic_exchange_explicit(&arena->remote_free_queue.head, NULL, memory_order_acquire);
     while (head) {
         block_header_t *next = head->next;
         head->magic = MAGIC_FREE;
@@ -823,7 +823,7 @@ void *mbd_alloc(size_t requested_size) {
     /* HOT PATH — lock-free */
 
     /* Opportunistic drain to prevent remote queue hoarding */
-    if (atomic_load(&arena->remote_free_queue.head) && pthread_mutex_trylock(&arena->lock) == 0) {
+    if (atomic_load_explicit(&arena->remote_free_queue.head, memory_order_acquire) && pthread_mutex_trylock(&arena->lock) == 0) {
         drain_remote_queue(arena);
         pthread_mutex_unlock(&arena->lock);
     }
@@ -983,9 +983,9 @@ void mbd_free(void *ptr) {
     if (data && block->arena != data->arena) {
         block_header_t *old_head;
         do {
-            old_head = atomic_load(&block->arena->remote_free_queue.head);
+            old_head = atomic_load_explicit(&block->arena->remote_free_queue.head, memory_order_acquire);
             block->next = old_head;
-        } while (!atomic_compare_exchange_weak(&block->arena->remote_free_queue.head, &old_head, block));
+        } while (!atomic_compare_exchange_weak_explicit(&block->arena->remote_free_queue.head, &old_head, block, memory_order_release, memory_order_acquire));
         return;
     }
 
@@ -1003,7 +1003,7 @@ void mbd_free(void *ptr) {
 
 
     /* Opportunistic drain to prevent remote queue hoarding */
-    if (atomic_load(&arena->remote_free_queue.head) && pthread_mutex_trylock(&arena->lock) == 0) {
+    if (atomic_load_explicit(&arena->remote_free_queue.head, memory_order_acquire) && pthread_mutex_trylock(&arena->lock) == 0) {
         drain_remote_queue(arena);
         pthread_mutex_unlock(&arena->lock);
     }
