@@ -880,6 +880,7 @@ void *mbd_alloc(size_t requested_size) {
     }
 
     pthread_mutex_lock(&arena->lock);
+    drain_remote_queue(arena);
 
     if (order <= SMALL_ORDER_MAX) {
         if (data) data->cache_misses++;
@@ -1299,9 +1300,9 @@ mbd_stats_t mbd_get_stats(void) {
 
     pthread_mutex_lock(&cache_list_lock);
     for (thread_cache_data_t *curr = global_cache_list; curr; curr = curr->next) {
-        s.cache_hits += atomic_load((_Atomic uint64_t*)&curr->cache_hits);
-        s.cache_misses += atomic_load((_Atomic uint64_t*)&curr->cache_misses);
-        s.bulk_flushes += atomic_load((_Atomic uint64_t*)&curr->bulk_flushes);
+        s.cache_hits += curr->cache_hits;
+        s.cache_misses += curr->cache_misses;
+        s.bulk_flushes += curr->bulk_flushes;
     }
     pthread_mutex_unlock(&cache_list_lock);
     return s;
