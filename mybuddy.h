@@ -203,6 +203,10 @@ void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t));
 
 /**
  * @brief Forces a trim of all thread caches, returning memory to the global arena.
+ * @note **Heavy Operation**: This triggers a cooperative trim where every thread will
+ *       completely flush its local cache on its next allocation or free. This causes a
+ *       100% cache miss rate immediately following the trim. Use only for low memory
+ *       emergencies, not for periodic lightweight usage.
  */
 void mbd_trim(void);
 
@@ -326,9 +330,9 @@ typedef struct thread_cache_data {
     block_header_t *cache[SMALL_ORDER_MAX + 1];
     uint32_t        count[SMALL_ORDER_MAX + 1];
     mbd_arena_t    *arena;
-    _Atomic uint64_t cache_hits;
-    _Atomic uint64_t cache_misses;
-    _Atomic uint64_t bulk_flushes;
+    uint64_t        cache_hits;
+    uint64_t        cache_misses;
+    uint64_t        bulk_flushes;
     int             last_trim_request;
     struct thread_cache_data *next;
 } __attribute__((aligned(64))) thread_cache_data_t;
@@ -857,11 +861,6 @@ void *mbd_alloc(size_t requested_size) {
 
     /* HOT PATH — lock-free */
 
-    /* Opportunistic drain to prevent remote queue hoarding */
-    if (arena->remote_free_queue.head != NULL && pthread_mutex_trylock(&arena->lock) == 0) {
-        drain_remote_queue(arena);
-        pthread_mutex_unlock(&arena->lock);
-    }
 
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
         block_header_t *block = data->cache[order];
@@ -1042,11 +1041,6 @@ void mbd_free(void *ptr) {
     }
 
 
-    /* Opportunistic drain to prevent remote queue hoarding */
-    if (arena->remote_free_queue.head != NULL && pthread_mutex_trylock(&arena->lock) == 0) {
-        drain_remote_queue(arena);
-        pthread_mutex_unlock(&arena->lock);
-    }
 
     if (data->count[order] < THREAD_CACHE_SIZE) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << block->order);
@@ -1235,6 +1229,10 @@ size_t mbd_malloc_usable_size(const void *ptr) {
 
 /**
  * @brief Forces a trim of all thread caches, returning memory to the global arena.
+ * @note **Heavy Operation**: This triggers a cooperative trim where every thread will
+ *       completely flush its local cache on its next allocation or free. This causes a
+ *       100% cache miss rate immediately following the trim. Use only for low memory
+ *       emergencies, not for periodic lightweight usage.
  */
 static void flush_my_cache(thread_cache_data_t *curr) {
     mbd_arena_t *locked_arena = NULL;
@@ -1301,9 +1299,9 @@ mbd_stats_t mbd_get_stats(void) {
 
     pthread_mutex_lock(&cache_list_lock);
     for (thread_cache_data_t *curr = global_cache_list; curr; curr = curr->next) {
-        s.cache_hits += atomic_load(&curr->cache_hits);
-        s.cache_misses += atomic_load(&curr->cache_misses);
-        s.bulk_flushes += atomic_load(&curr->bulk_flushes);
+        s.cache_hits += atomic_load((_Atomic uint64_t*)&curr->cache_hits);
+        s.cache_misses += atomic_load((_Atomic uint64_t*)&curr->cache_misses);
+        s.bulk_flushes += atomic_load((_Atomic uint64_t*)&curr->bulk_flushes);
     }
     pthread_mutex_unlock(&cache_list_lock);
     return s;
