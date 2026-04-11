@@ -73,7 +73,7 @@ extern "C" {
 /* ── Configuration Macros ─────────────────────────────────────────── */
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
-#define MIN_ORDER          4              // 16 bytes minimum block size
+#define MIN_ORDER          5              // 32 bytes minimum block size
 #define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 #define THREAD_CACHE_SIZE  64
 
@@ -450,9 +450,6 @@ static void drain_remote_queue(mbd_arena_t *arena) {
         block_header_t *next = head->next;
         head->magic = MAGIC_FREE;
 
-        // IMPORTANT: The original block pointer must be passed and updated if it coalesces!
-        // But coalesce_up in original mybuddy.h returned uint32_t and did not update the caller's pointer!
-        // We will fix coalesce_up to take a block_header_t**
         uint32_t order = head->order;
         head = coalesce_up_and_update(arena, head, &order);
         arena_insert(arena, order, head);
@@ -985,7 +982,7 @@ void mbd_free(void *ptr) {
         do {
             old_head = atomic_load_explicit(&block->arena->remote_free_queue.head, memory_order_acquire);
             block->next = old_head;
-        } while (!atomic_compare_exchange_weak_explicit(&block->arena->remote_free_queue.head, &old_head, block, memory_order_release, memory_order_acquire));
+        } while (!atomic_compare_exchange_weak_explicit(&block->arena->remote_free_queue.head, &old_head, block, memory_order_release, memory_order_relaxed));
         return;
     }
 
@@ -1042,10 +1039,11 @@ void mbd_free(void *ptr) {
             drain_remote_queue(locked_arena);
         }
 
+        uint32_t original_order = to_global->order;
         uint32_t o = to_global->order;
         to_global = coalesce_up_and_update(locked_arena, to_global, &o);
         arena_insert(locked_arena, o, to_global);
-        bytes_flushed += (1ULL << to_global->order);
+        bytes_flushed += (1ULL << original_order);
     }
     
     if (locked_arena) {
