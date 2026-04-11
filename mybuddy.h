@@ -416,7 +416,7 @@ static block_header_t* split_block_down(mbd_arena_t *arena, block_header_t *bloc
     return block;
 }
 
-static block_header_t* coalesce_up(mbd_arena_t *arena, block_header_t *block, uint32_t *order_out) {
+static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t *block, uint32_t *order_out) {
     uint32_t order = *order_out;
     while (order < MAX_ORDER) {
         block_header_t *buddy = get_buddy(arena, block, order);
@@ -455,7 +455,7 @@ static void drain_remote_queue(mbd_arena_t *arena) {
         // But coalesce_up in original mybuddy.h returned uint32_t and did not update the caller's pointer!
         // We will fix coalesce_up to take a block_header_t**
         uint32_t order = head->order;
-        head = coalesce_up(arena, head, &order);
+        head = coalesce_up_and_update(arena, head, &order);
         arena_insert(arena, order, head);
         head = next;
     }
@@ -514,7 +514,7 @@ static void thread_cache_destructor(void *arg) {
             }
 
             uint32_t order = block->order;
-            block = coalesce_up(locked_arena, block, &order);
+            block = coalesce_up_and_update(locked_arena, block, &order);
             arena_insert(locked_arena, order, block);
             bytes_flushed += (1ULL << o);
         }
@@ -537,7 +537,7 @@ static void thread_cache_destructor(void *arg) {
     pthread_mutex_lock(&cache_arena->lock);
     drain_remote_queue(cache_arena);
     uint32_t co = cache_block->order;
-    cache_block = coalesce_up(cache_arena, cache_block, &co);
+    cache_block = coalesce_up_and_update(cache_arena, cache_block, &co);
     arena_insert(cache_arena, co, cache_block);
     pthread_mutex_unlock(&cache_arena->lock);
     atomic_fetch_sub(&active_threads, 1);
@@ -646,7 +646,7 @@ static thread_cache_data_t *get_thread_cache(void) {
                         block->magic = MAGIC_FREE;
 
                         uint32_t o = block->order;
-                        block = coalesce_up(other_arena, block, &o);
+                        block = coalesce_up_and_update(other_arena, block, &o);
                         arena_insert(other_arena, o, block);
                         pthread_mutex_unlock(&other_arena->lock);
                         return NULL;
@@ -686,7 +686,7 @@ static thread_cache_data_t *get_thread_cache(void) {
             block->magic = MAGIC_FREE;
 
             uint32_t o = block->order;
-            block = coalesce_up(arena, block, &o);
+            block = coalesce_up_and_update(arena, block, &o);
             arena_insert(arena, o, block);
             pthread_mutex_unlock(&arena->lock);
             return NULL;
@@ -822,6 +822,13 @@ void *mbd_alloc(size_t requested_size) {
     uint32_t order = next_power_of_two_order(needed);
 
     /* HOT PATH — lock-free */
+
+    /* Opportunistic drain to prevent remote queue hoarding */
+    if (atomic_load(&arena->remote_free_queue.head) && pthread_mutex_trylock(&arena->lock) == 0) {
+        drain_remote_queue(arena);
+        pthread_mutex_unlock(&arena->lock);
+    }
+
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
         block_header_t *block = data->cache[order];
         data->cache[order] = block->next;
@@ -965,7 +972,7 @@ void mbd_free(void *ptr) {
         drain_remote_queue(arena);
         block->magic = MAGIC_FREE;
 
-        block = coalesce_up(arena, block, &order);
+        block = coalesce_up_and_update(arena, block, &order);
         arena_insert(arena, order, block);
         pthread_mutex_unlock(&arena->lock);
         return;
@@ -989,10 +996,17 @@ void mbd_free(void *ptr) {
         drain_remote_queue(arena);
         block->magic = MAGIC_FREE;
 
-        block = coalesce_up(arena, block, &order);
+        block = coalesce_up_and_update(arena, block, &order);
         arena_insert(arena, order, block);
         pthread_mutex_unlock(&arena->lock);
         return;
+    }
+
+
+    /* Opportunistic drain to prevent remote queue hoarding */
+    if (atomic_load(&arena->remote_free_queue.head) && pthread_mutex_trylock(&arena->lock) == 0) {
+        drain_remote_queue(arena);
+        pthread_mutex_unlock(&arena->lock);
     }
 
     if (data->count[order] < THREAD_CACHE_SIZE) {
@@ -1030,7 +1044,7 @@ void mbd_free(void *ptr) {
         }
 
         uint32_t o = to_global->order;
-        to_global = coalesce_up(locked_arena, to_global, &o);
+        to_global = coalesce_up_and_update(locked_arena, to_global, &o);
         arena_insert(locked_arena, o, to_global);
         bytes_flushed += (1ULL << to_global->order);
     }
@@ -1209,7 +1223,7 @@ void mbd_trim(void) {
 
                 uint32_t original_order = block->order;
                 uint32_t coalesced_order = original_order;
-                block = coalesce_up(locked_arena, block, &coalesced_order);
+                block = coalesce_up_and_update(locked_arena, block, &coalesced_order);
                 arena_insert(locked_arena, coalesced_order, block);
 
                 atomic_fetch_sub(&global_cached_bytes, 1ULL << original_order);
