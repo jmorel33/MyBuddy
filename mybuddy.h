@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.2
+ * @version 1.3
  * @date April 11, 2026
  * @author Jacques Morel
  *
