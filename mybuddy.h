@@ -645,13 +645,6 @@ static thread_cache_data_t *get_thread_cache(void) {
                     memset(data, 0, sizeof(thread_cache_data_t));
                     data->arena = other_arena;
 
-                    data->next = NULL;
-                    pthread_mutex_lock(&cache_list_lock);
-                    data->next = global_cache_list;
-                    global_cache_list = data;
-                    pthread_mutex_unlock(&cache_list_lock);
-                    // Affined cache requests to the thread's native arena.
-                    
                     if (pthread_setspecific(thread_cache_key, data) != 0) {
                         block->used = 0;
                         block->magic = encode_magic(block, MAGIC_FREE);
@@ -662,6 +655,14 @@ static thread_cache_data_t *get_thread_cache(void) {
                         pthread_mutex_unlock(&other_arena->lock);
                         return NULL;
                     }
+
+                    data->next = NULL;
+                    pthread_mutex_lock(&cache_list_lock);
+                    data->next = global_cache_list;
+                    global_cache_list = data;
+                    pthread_mutex_unlock(&cache_list_lock);
+                    // Affined cache requests to the thread's native arena.
+
                     atomic_fetch_add(&active_threads, 1);
                     pthread_mutex_unlock(&other_arena->lock);
                     return data;
@@ -685,13 +686,6 @@ static thread_cache_data_t *get_thread_cache(void) {
         memset(data, 0, sizeof(thread_cache_data_t));
         data->arena = arena;
 
-        data->next = NULL;
-        pthread_mutex_lock(&cache_list_lock);
-        data->next = global_cache_list;
-        global_cache_list = data;
-        pthread_mutex_unlock(&cache_list_lock);
-
-
         if (pthread_setspecific(thread_cache_key, data) != 0) {
             block->used = 0;
             block->magic = encode_magic(block, MAGIC_FREE);
@@ -702,6 +696,13 @@ static thread_cache_data_t *get_thread_cache(void) {
             pthread_mutex_unlock(&arena->lock);
             return NULL;
         }
+
+        data->next = NULL;
+        pthread_mutex_lock(&cache_list_lock);
+        data->next = global_cache_list;
+        global_cache_list = data;
+        pthread_mutex_unlock(&cache_list_lock);
+
         atomic_fetch_add(&active_threads, 1);
         pthread_mutex_unlock(&arena->lock);
     }
