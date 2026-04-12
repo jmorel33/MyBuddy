@@ -1,1 +1,0 @@
-run_lldb.sh: line 4: lldb: command not found
