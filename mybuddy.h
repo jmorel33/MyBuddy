@@ -341,7 +341,6 @@ typedef struct thread_cache_data {
     int             last_trim_request;
     _Atomic uint64_t last_active_timestamp;
     _Atomic int     is_reaping;
-    pid_t           kernel_tid;
     struct thread_cache_data *next;
 } __attribute__((aligned(64))) thread_cache_data_t;
 
@@ -411,6 +410,16 @@ static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t ord
 /* ================================================================== *
  *                       HELPER FUNCTIONS                             *
  * ================================================================== */
+
+static inline uint64_t get_current_timestamp(void) {
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC_COARSE)
+    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
+#else
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+#endif
+    return (uint64_t)ts.tv_sec;
+}
 
 static inline uint32_t next_power_of_two_order(size_t req) {
     if (req <= (1ULL << MIN_ORDER)) {
@@ -599,6 +608,9 @@ static void internal_init(void) {
         
         arenas[a].memory_pool = (uint8_t *)mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (arenas[a].memory_pool == MAP_FAILED) abort();
+#if defined(MADV_HUGEPAGE)
+        madvise(arenas[a].memory_pool, POOL_SIZE, MADV_HUGEPAGE);
+#endif
 
         block_header_t *initial = (block_header_t *)arenas[a].memory_pool;
         initial->order = MAX_ORDER;
@@ -667,13 +679,8 @@ static thread_cache_data_t *get_thread_cache(void) {
                     data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
                     memset(data, 0, sizeof(thread_cache_data_t));
                     data->arena = other_arena;
-                    atomic_init(&data->last_active_timestamp, (uint64_t)time(NULL));
+                    atomic_init(&data->last_active_timestamp, get_current_timestamp());
                     atomic_init(&data->is_reaping, 0);
-#if defined(__linux__)
-                    data->kernel_tid = (pid_t)syscall(SYS_gettid);
-#else
-                    data->kernel_tid = 0;
-#endif
 
                     data->next = NULL;
                     pthread_mutex_lock(&cache_list_lock);
@@ -714,13 +721,8 @@ static thread_cache_data_t *get_thread_cache(void) {
         data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
         memset(data, 0, sizeof(thread_cache_data_t));
         data->arena = arena;
-        atomic_init(&data->last_active_timestamp, (uint64_t)time(NULL));
+        atomic_init(&data->last_active_timestamp, get_current_timestamp());
         atomic_init(&data->is_reaping, 0);
-#if defined(__linux__)
-        data->kernel_tid = (pid_t)syscall(SYS_gettid);
-#else
-        data->kernel_tid = 0;
-#endif
 
         data->next = NULL;
         pthread_mutex_lock(&cache_list_lock);
@@ -868,6 +870,11 @@ void *mbd_alloc(size_t requested_size) {
             handle_oom();
             return NULL;
         }
+#if defined(MADV_HUGEPAGE)
+        if (needed >= (2 * 1024 * 1024)) {
+            madvise(block, needed, MADV_HUGEPAGE);
+        }
+#endif
         block->is_mmap = 1;
         block->magic = encode_magic(block, MAGIC_MMAP);
         block->arena = NULL;
@@ -914,7 +921,7 @@ void *mbd_alloc(size_t requested_size) {
     if (order <= SMALL_ORDER_MAX) {
         if (data) {
             data->cache_misses++;
-            atomic_store(&data->last_active_timestamp, (uint64_t)time(NULL));
+            atomic_store(&data->last_active_timestamp, get_current_timestamp());
         }
         refill_thread_cache(data, order);
         if (data->cache[order]) {
@@ -1089,7 +1096,7 @@ void mbd_free(void *ptr) {
 
     /* Bulk flush with grouped lock acquisition to prevent thrashing */
     data->bulk_flushes++;
-    atomic_store(&data->last_active_timestamp, (uint64_t)time(NULL));
+    atomic_store(&data->last_active_timestamp, get_current_timestamp());
     MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, THREAD_CACHE_SIZE / 2);
     mbd_arena_t *locked_arena = NULL;
     int flush_count = THREAD_CACHE_SIZE / 2;
@@ -1344,19 +1351,21 @@ void mbd_trim(void) {
     atomic_fetch_add(&trim_requested, 1);
 
     /* Reaper mechanism: flush caches of threads that are genuinely dead (avoid data races with active threads) */
+    uint64_t now = get_current_timestamp();
     pthread_mutex_lock(&cache_list_lock);
     thread_cache_data_t **curr_ptr = &global_cache_list;
     while (*curr_ptr) {
         thread_cache_data_t *curr = *curr_ptr;
-        /* Check if the thread exists using kill(kernel_tid, 0). ESRCH means it is dead. */
+        /* Liveness heuristic: Check if the thread has been inactive for > 60 seconds */
         int is_dead = 0;
-#if defined(__linux__)
-        if (kill(curr->kernel_tid, 0) == -1 && errno == ESRCH) {
-            is_dead = 1;
+        if (now - atomic_load(&curr->last_active_timestamp) > 60) {
+            int expected = 0;
+            if (atomic_compare_exchange_strong(&curr->is_reaping, &expected, 1)) {
+                is_dead = 1;
+            }
         }
-#endif
         if (is_dead) {
-            /* Thread is dead but didn't clean up its cache (e.g. hard exit or quick_exit) */
+            /* Thread is inactive and we successfully acquired the reaper flag */
             /* Remove it from the global list */
             *curr_ptr = curr->next;
 
