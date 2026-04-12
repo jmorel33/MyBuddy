@@ -73,7 +73,7 @@ extern "C" {
 /* ── Configuration Macros ─────────────────────────────────────────── */
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
-#define MIN_ORDER          6              // 64 bytes minimum block size
+#define MIN_ORDER          7              // 128 bytes minimum block size
 #define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 
 /* ── Public API ───────────────────────────────────────────────────── */
@@ -223,41 +223,6 @@ void mbd_set_oom_handler(void (*handler)(void));
  */
 void mbd_dump(void);
 
-/* ── String Helpers ───────────────────────────────────────────────── */
-typedef struct {
-    const char* data;   // pointer to character data (may not be null-terminated)
-    size_t      len;    // exact length in bytes
-} mbd_string_view_t;
-
-/**
- * @brief Create a string view from a classic null-terminated C string.
- *        The view does **not** allocate or copy data.
- *
- * @param s A null-terminated C string.
- * @return mbd_string_view_t A string view struct pointing to the data.
- */
-mbd_string_view_t mbd_string_view_from_cstr(const char *s);
-
-/**
- * @brief Create a string view from raw data + exact length.
- *        ie. binary data, network buffers, or when you know the length.
- *        The view does **not** allocate or copy data.
- *
- * @param data Raw byte data.
- * @param len  Exact length in bytes.
- * @return mbd_string_view_t A string view struct pointing to the data.
- */
-mbd_string_view_t mbd_string_view_from_data(const char *data, size_t len);
-
-/**
- * @brief Allocate a null-terminated C string copy from a string view
- *        (uses mbd_alloc internally). Useful for classic C string.
- *
- * @param view The string view to duplicate.
- * @return char* A newly allocated, null-terminated C string, or NULL on failure.
- */
-char *mbd_string_view_dup(mbd_string_view_t view);
-
 #ifdef __cplusplus
 }
 #endif
@@ -278,8 +243,9 @@ char *mbd_string_view_dup(mbd_string_view_t view);
 #include <sys/syscall.h>
 #include <stdatomic.h>
 #include <assert.h>
+#include <time.h>
 
-#ifndef MAP_NORESERVE
+#if defined(__linux__) && !defined(MAP_NORESERVE)
 #define MAP_NORESERVE 0x4000
 #endif
 
@@ -359,14 +325,15 @@ static _Atomic int trim_requested = 0;
 
 static pthread_key_t thread_cache_key;
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
-static void (*global_oom_handler)(void) = NULL;
-static void (*global_profiler_hook)(mbd_event_type_t, void*, size_t) = NULL;
+static _Atomic(void (*)(void)) global_oom_handler = NULL;
+static _Atomic(void (*)(mbd_event_type_t, void*, size_t)) global_profiler_hook = NULL;
 
 #ifdef MYBUDDY_ENABLE_PROFILING
     #define MBD_FIRE_EVENT(type, ptr, sz) \
         do { \
-            if (__builtin_expect(global_profiler_hook != NULL, 0)) \
-                global_profiler_hook(type, ptr, sz); \
+            void (*hook)(mbd_event_type_t, void*, size_t) = atomic_load(&global_profiler_hook); \
+            if (__builtin_expect(hook != NULL, 0)) \
+                hook(type, ptr, sz); \
         } while(0)
 #else
     #define MBD_FIRE_EVENT(type, ptr, sz) do {} while(0)
@@ -495,7 +462,8 @@ static void drain_remote_queue(mbd_arena_t *arena) {
 
 
 static void handle_oom(void) {
-    if (global_oom_handler) global_oom_handler();
+    void (*hook)(void) = atomic_load(&global_oom_handler);
+    if (hook) hook();
 }
 
 /* ================================================================== *
@@ -820,6 +788,15 @@ void mbd_destroy(void) {
         pthread_mutex_destroy(&arenas[a].remote_lock);
     }
     pthread_key_delete(thread_cache_key);
+
+    /* Reset state for re-initialization */
+    static const pthread_once_t once_reset = PTHREAD_ONCE_INIT;
+    init_once = once_reset;
+    arenas = NULL;
+    arena_count = 1;
+    atomic_store(&thread_counter, 0);
+    atomic_store(&active_threads, 0);
+    global_cache_list = NULL;
 }
 
 /**
@@ -828,7 +805,7 @@ void mbd_destroy(void) {
  * @param handler Function pointer to the handler.
  */
 void mbd_set_oom_handler(void (*handler)(void)) {
-    global_oom_handler = handler;
+    atomic_store(&global_oom_handler, handler);
 }
 
 /**
@@ -837,7 +814,7 @@ void mbd_set_oom_handler(void (*handler)(void)) {
  * @param hook Function pointer to the hook.
  */
 void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t)) {
-    global_profiler_hook = hook;
+    atomic_store(&global_profiler_hook, hook);
 }
 
 
@@ -927,7 +904,9 @@ void *mbd_alloc(size_t requested_size) {
             block->magic = encode_magic(block, MAGIC_ALLOC);
             block->next = block->prev = NULL;
             pthread_mutex_unlock(&arena->lock);
-            return (void *)((uint8_t*)block + HEADER_SIZE);
+            void *res = (void *)((uint8_t*)block + HEADER_SIZE);
+            MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
+            return res;
         }
     }
 
@@ -1229,7 +1208,12 @@ void *mbd_calloc(size_t nmemb, size_t size) {
     if (total == 0) return mbd_alloc(1); // POSIX-consistent
 
     void *ptr = mbd_alloc(total);
-    if (ptr) memset(ptr, 0, total);
+    if (ptr) {
+        block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
+        if (!block->is_mmap) {
+            memset(ptr, 0, total);
+        }
+    }
     return ptr;
 }
 
@@ -1392,53 +1376,6 @@ void mbd_dump(void) {
         printf("==================================\n\n");
         pthread_mutex_unlock(&arenas[a].lock);
     }
-}
-
-/* ================================================================== *
- *                       STRING HELPERS                               *
- * ================================================================== */
- 
-/**
- * @brief Create a string view from a classic null-terminated C string.
- *        The view does **not** allocate or copy data.
- *
- * @param s A null-terminated C string.
- * @return mbd_string_view_t A string view struct pointing to the data.
- */
-mbd_string_view_t mbd_string_view_from_cstr(const char *s) {
-    if (!s) return (mbd_string_view_t){NULL, 0};
-    return (mbd_string_view_t){s, strlen(s)};
-}
-
-/**
- * @brief Create a string view from raw data + exact length.
- *        ie. binary data, network buffers, or when you know the length.
- *        The view does **not** allocate or copy data.
- *
- * @param data Raw byte data.
- * @param len  Exact length in bytes.
- * @return mbd_string_view_t A string view struct pointing to the data.
- */
-mbd_string_view_t mbd_string_view_from_data(const char *data, size_t len) {
-    return (mbd_string_view_t){data, len};
-}
-
-/**
- * @brief Allocate a null-terminated C string copy from a string view
- *        (uses mbd_alloc internally). Useful for classic C string.
- *
- * @param view The string view to duplicate.
- * @return char* A newly allocated, null-terminated C string, or NULL on failure.
- */
-char *mbd_string_view_dup(mbd_string_view_t view) {
-    if (!view.data || view.len == 0) return NULL;
-
-    char *copy = (char *)mbd_alloc(view.len + 1);
-    if (copy) {
-        memcpy(copy, view.data, view.len);
-        copy[view.len] = '\0';
-    }
-    return copy;
 }
 
 #endif /* MYBUDDY_IMPLEMENTATION */
