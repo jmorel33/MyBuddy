@@ -245,8 +245,16 @@ void mbd_dump(void);
 #include <assert.h>
 #include <time.h>
 
-#if defined(__linux__) && !defined(MAP_NORESERVE)
-#define MAP_NORESERVE 0x4000
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+
+#ifndef MADV_DONTNEED
+#ifdef MADV_FREE
+#define MADV_DONTNEED MADV_FREE
+#else
+#define MADV_DONTNEED 0
+#endif
 #endif
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -265,7 +273,7 @@ typedef struct block_header {
     uint8_t used;       // 1
     uint8_t is_mmap;    // 1 (Direct mmap flag)
     uint8_t _padding;   // 1
-    uint32_t magic;     // 4
+    uint32_t magic;     // 4 (always 32-bit to fit in 32-byte header on 64-bit systems)
     struct mbd_arena *arena; // 8 or 4
     struct block_header *next;  // 8 or 4
     union {
@@ -317,6 +325,7 @@ static long os_page_size = 4096;
 static pthread_mutex_t cache_list_lock = PTHREAD_MUTEX_INITIALIZER;
 static thread_cache_data_t *global_cache_list = NULL;
 static _Atomic int trim_requested = 0;
+static _Atomic int fully_destroyed = 0;
 
 static pthread_key_t thread_cache_key;
 static pthread_once_t init_once = PTHREAD_ONCE_INIT;
@@ -342,8 +351,16 @@ static const uint32_t MAGIC_MMAP     = 0x8BADF00D;
 
 static uint32_t mbd_secret_key = 0;
 
+static inline int arena_index(const mbd_arena_t *a) {
+    return (int)(a - arenas);
+}
+
 static inline uint32_t encode_magic(void *block, uint32_t magic) {
-    return magic ^ (uint32_t)((uintptr_t)block & 0xFFFFFFFF) ^ mbd_secret_key;
+    uint32_t addr_hash = (uint32_t)((uintptr_t)block & 0xFFFFFFFF);
+#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL
+    addr_hash ^= (uint32_t)((uintptr_t)block >> 32);
+#endif
+    return magic ^ addr_hash ^ mbd_secret_key;
 }
 
 /* ================================================================== *
@@ -380,7 +397,17 @@ static inline uint32_t next_power_of_two_order(size_t req) {
     if (req <= (1ULL << MIN_ORDER)) {
         return MIN_ORDER;
     }
+#if defined(__GNUC__) || defined(__clang__)
     return 64 - __builtin_clzll(req - 1);
+#else
+    req--;
+    uint32_t order = 0;
+    while (req > 0) {
+        req >>= 1;
+        order++;
+    }
+    return order;
+#endif
 }
 
 static inline block_header_t *get_buddy(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
@@ -579,6 +606,8 @@ static void internal_init(void) {
  */
 static void flush_my_cache(thread_cache_data_t *curr);
 static thread_cache_data_t *get_thread_cache(void) {
+    if (atomic_load(&fully_destroyed)) return NULL;
+
     pthread_once(&init_once, internal_init);
 
     thread_cache_data_t *data = pthread_getspecific(thread_cache_key);
@@ -755,14 +784,13 @@ void mbd_destroy(void) {
     }
     pthread_key_delete(thread_cache_key);
 
-    /* Reset state for re-initialization */
-    static const pthread_once_t once_reset = PTHREAD_ONCE_INIT;
-    init_once = once_reset;
     arenas = NULL;
     arena_count = 1;
     atomic_store(&thread_counter, 0);
     atomic_store(&active_threads, 0);
     global_cache_list = NULL;
+
+    atomic_store(&fully_destroyed, 1);
 }
 
 /**
@@ -1047,6 +1075,22 @@ void mbd_free(void *ptr) {
 
         if (locked_arena != block_arena) {
             if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+
+            // Enforce global order: always lock lower-index arena first
+            if (locked_arena && arena_index(locked_arena) > arena_index(block_arena)) {
+                // Release and re-acquire in correct order (rare but safe)
+                pthread_mutex_lock(&block_arena->lock);
+                drain_remote_queue(block_arena);
+                uint32_t original_order = to_global->order;
+                uint32_t o = to_global->order;
+                to_global = coalesce_up_and_update(block_arena, to_global, &o);
+                arena_insert(block_arena, o, to_global);
+                atomic_fetch_sub(&block_arena->cached_bytes, 1ULL << original_order);
+                atomic_fetch_sub(&block_arena->cache_pressure, 1ULL << original_order);
+                pthread_mutex_unlock(&block_arena->lock);
+                locked_arena = NULL; // reset because we dropped lock
+                continue;
+            }
             locked_arena = block_arena;
             pthread_mutex_lock(&locked_arena->lock);
             drain_remote_queue(locked_arena);
@@ -1118,7 +1162,10 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return new_ptr;
     }
 
-    if (block->magic != encode_magic(block, MAGIC_ALLOC)) abort();
+    if (block->magic != encode_magic(block, MAGIC_ALLOC)) {
+        fprintf(stderr, "mbd_realloc: DOUBLE-FREE or corruption!\n");
+        abort();
+    }
 
     size_t old_usable = ((size_t)1 << block->order) - HEADER_SIZE;
     if (new_size <= old_usable) return ptr;
@@ -1146,6 +1193,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, block->order);
 
         block->order += 1;
+        block->magic = encode_magic(block, MAGIC_ALLOC);
     }
     pthread_mutex_unlock(&arena->lock);
 
