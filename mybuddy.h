@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.3.1
+ * @version 1.3.2
  * @date April 11, 2026
  * @author Jacques Morel
  *
@@ -13,9 +13,9 @@
  * @section features Key Strengths
  * - **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles.
  * - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks.
- * - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, magic-value validation, and defused memalign exploits.
+ * - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation, and defused memalign exploits.
  * - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` to prevent memory hoarding.
- * - **Advanced Alignment**: Mathematically guaranteed 32-byte minimum alignment, plus `mbd_memalign()` for strict AVX-512 (64-byte+) requirements.
+ * - **Advanced Alignment**: Mathematically guaranteed 64-byte minimum alignment (AVX-512 native), plus `mbd_memalign()` for stricter requirements.
  * - **Huge Allocations**: Requests over 128 MiB seamlessly bypass the buddy pool and use tracked direct `mmap()`/`munmap()`.
  * - **Production Readiness**: LD_PRELOAD-safe, self-initializing, includes atomic stats tracking (`mbd_get_stats`), and custom OOM handler hooks.
  *
