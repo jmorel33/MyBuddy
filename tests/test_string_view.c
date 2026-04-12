@@ -1,5 +1,6 @@
 #define MYBUDDY_IMPLEMENTATION
 #include "../mybuddy.h"
+#include "../mbd_strings.h"
 #include <stdio.h>
 #include <assert.h>
 #include <string.h>

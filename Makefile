@@ -14,7 +14,7 @@ tests/test_threads: tests/test_threads.c mybuddy.h
 tests/test_huge: tests/test_huge.c mybuddy.h
 	$(CC) $(CFLAGS) $< -o $@
 
-tests/test_string_view: tests/test_string_view.c mybuddy.h
+tests/test_string_view: tests/test_string_view.c mybuddy.h mbd_strings.h
 	$(CC) $(CFLAGS) $< -o $@
 
 tests/test_usable_size: tests/test_usable_size.c mybuddy.h

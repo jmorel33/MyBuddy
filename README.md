@@ -91,11 +91,19 @@ int main() {
 
 *Note: The allocator is self-initializing. The first call to `mbd_alloc()` or `mbd_free()` will automatically initialize the pool. For latency-sensitive applications, you may still call `mbd_init()` explicitly during startup.*
 
+## Recent Changes (1.3.3)
+- Fixed false sharing by migrating heavily contended global statistic atomic variables to 64-byte aligned per-arena structs.
+- Removed racy liveness heuristics from `mbd_trim`, instead relying strictly on safe POSIX thread destructors to reclaim dead thread caches.
+- Replaced a single flat `THREAD_CACHE_SIZE` metric with dynamic per-order cache sizing limits (`get_cache_limit`).
+- Selectively applied `MADV_HUGEPAGE` and `MADV_DONTDUMP` across large long-lived mappings.
+- Cleaned up string view functions and isolated them from the main header into `mbd_strings.h`.
+- Fixed initialization memory leak in `get_thread_cache` and removed redundant memory zeroing in `mbd_calloc` for implicitly-zeroed direct mmap requests.
+- Prevented zero-usable-space payloads by pushing `MIN_ORDER` to 7 (128 bytes).
+
 ## Recent Changes (1.3.2)
-- Increased `MIN_ORDER` to 6 and padded headers to 64 bytes to naturally support AVX-512 alignment without requiring `mbd_memalign`.
+- Padded headers to 64 bytes to naturally support AVX-512 alignment without requiring `mbd_memalign`.
 - Added in-place coalescing in `mbd_realloc` to efficiently expand buffers without copying data if the adjacent buddy block is free.
 - Hardened block headers by check-summing magic values with a global, randomized entropy key using XOR to mitigate heap corruption.
-- Added a Reaper mechanism in `mbd_trim` to safely recover memory from leaked TLS caches when threads die unexpectedly (e.g. `pthread_exit`, hard exit) using `kill(tid, 0) == ESRCH`.
 
 ## API Reference
 
@@ -126,16 +134,6 @@ int main() {
   Forces a trim of all thread caches, returning memory to the global arena.
 - `void mbd_dump(void);`
   Prints the current state of the global free lists for diagnostics.
-
-### String View Helpers
-MyBuddy includes a simple, allocation-free string view struct `mbd_string_view_t` to handle strings efficiently.
-
-- `mbd_string_view_t mbd_string_view_from_cstr(const char *s);`
-  Create a string view from a null-terminated C string (does not allocate).
-- `mbd_string_view_t mbd_string_view_from_data(const char *data, size_t len);`
-  Create a string view from raw data and exact length (does not allocate).
-- `char *mbd_string_view_dup(mbd_string_view_t view);`
-  Allocate a null-terminated C string copy from a string view (uses `mbd_alloc`).
 
 ## Compilation / Linking
 
