@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.3.1
+ * @version 1.3.2
  * @date April 11, 2026
  * @author Jacques Morel
  *
@@ -13,9 +13,9 @@
  * @section features Key Strengths
  * - **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles.
  * - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks.
- * - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, magic-value validation, and defused memalign exploits.
+ * - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation, and defused memalign exploits.
  * - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` to prevent memory hoarding.
- * - **Advanced Alignment**: Mathematically guaranteed 32-byte minimum alignment, plus `mbd_memalign()` for strict AVX-512 (64-byte+) requirements.
+ * - **Advanced Alignment**: Mathematically guaranteed 64-byte minimum alignment (AVX-512 native), plus `mbd_memalign()` for stricter requirements.
  * - **Huge Allocations**: Requests over 128 MiB seamlessly bypass the buddy pool and use tracked direct `mmap()`/`munmap()`.
  * - **Production Readiness**: LD_PRELOAD-safe, self-initializing, includes atomic stats tracking (`mbd_get_stats`), and custom OOM handler hooks.
  *
@@ -73,7 +73,7 @@ extern "C" {
 /* ── Configuration Macros ─────────────────────────────────────────── */
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
-#define MIN_ORDER          5              // 32 bytes minimum block size
+#define MIN_ORDER          6              // 64 bytes minimum block size
 #define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 #define THREAD_CACHE_SIZE  64
 
@@ -274,6 +274,9 @@ char *mbd_string_view_dup(mbd_string_view_t view);
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/mman.h>
+#include <errno.h>
+#include <signal.h>
+#include <sys/syscall.h>
 #include <stdatomic.h>
 #include <assert.h>
 
@@ -305,9 +308,11 @@ typedef struct block_header {
         size_t mmap_size;           // Used when is_mmap == 1
     };
 #if UINTPTR_MAX == 0xFFFFFFFFULL
-    uint32_t _align_pad[3];     // +12 bytes on 32-bit → exactly 32 bytes
+    uint32_t _align_pad[11];    // +44 bytes on 32-bit → exactly 64 bytes
+#else
+    uint32_t _align_pad[8];     // +32 bytes on 64-bit → exactly 64 bytes
 #endif
-} block_header_t __attribute__((aligned(32)));
+} block_header_t __attribute__((aligned(64)));
 
 typedef struct mbd_arena {
     pthread_mutex_t lock;
@@ -334,6 +339,9 @@ typedef struct thread_cache_data {
     uint64_t        cache_misses;
     uint64_t        bulk_flushes;
     int             last_trim_request;
+    _Atomic uint64_t last_active_timestamp;
+    _Atomic int     is_reaping;
+    pid_t           kernel_tid;
     struct thread_cache_data *next;
 } __attribute__((aligned(64))) thread_cache_data_t;
 
@@ -374,6 +382,12 @@ static const uint32_t MAGIC_FREE     = 0xDEADBEEF;
 static const uint32_t MAGIC_CACHED   = 0xBAADF00D;
 static const uint32_t MAGIC_MEMALIGN = 0x00000A11;
 static const uint32_t MAGIC_MMAP     = 0x8BADF00D;
+
+static uint32_t mbd_secret_key = 0;
+
+static inline uint32_t encode_magic(void *block, uint32_t magic) {
+    return magic ^ (uint32_t)((uintptr_t)block & 0xFFFFFFFF) ^ mbd_secret_key;
+}
 
 /* ================================================================== *
  *                       ARENA LIST OPERATIONS                        *
@@ -421,7 +435,7 @@ static block_header_t* split_block_down(mbd_arena_t *arena, block_header_t *bloc
         buddy->order = new_order;
         buddy->used  = 0;
         buddy->is_mmap = 0;
-        buddy->magic = MAGIC_FREE;
+        buddy->magic = encode_magic(buddy, MAGIC_FREE);
 
         buddy->arena = arena;
         buddy->next = buddy->prev = NULL;
@@ -437,7 +451,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     uint32_t order = *order_out;
     while (order < MAX_ORDER) {
         block_header_t *buddy = get_buddy(arena, block, order);
-        if (!buddy || buddy->magic != MAGIC_FREE || buddy->order != order || buddy->arena != arena) break;
+        if (!buddy || buddy->magic != encode_magic(buddy, MAGIC_FREE) || buddy->order != order || buddy->arena != arena) break;
         arena_remove(arena, buddy, order);
         atomic_fetch_add(&global_coalesces, 1);
         MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, order);
@@ -468,7 +482,7 @@ static void drain_remote_queue(mbd_arena_t *arena) {
     pthread_mutex_unlock(&arena->remote_lock);
     while (head) {
         block_header_t *next = head->next;
-        head->magic = MAGIC_FREE;
+        head->magic = encode_magic(head, MAGIC_FREE);
 
         uint32_t order = head->order;
         head = coalesce_up_and_update(arena, head, &order);
@@ -519,7 +533,7 @@ static void thread_cache_destructor(void *arg) {
             block_header_t *block = data->cache[o];
             data->cache[o] = block->next;
             
-            block->magic = MAGIC_FREE;
+            block->magic = encode_magic(block, MAGIC_FREE);
 
             mbd_arena_t *block_arena = block->arena;
 
@@ -547,7 +561,7 @@ static void thread_cache_destructor(void *arg) {
     /* Return the cache struct itself */
     block_header_t *cache_block = (block_header_t *)((uint8_t*)data - HEADER_SIZE);
     cache_block->used = 0;
-    cache_block->magic = MAGIC_FREE;
+    cache_block->magic = encode_magic(cache_block, MAGIC_FREE);
     mbd_arena_t *cache_arena = cache_block->arena;
 
     pthread_mutex_lock(&cache_arena->lock);
@@ -568,6 +582,7 @@ static void thread_cache_destructor(void *arg) {
 static mbd_arena_t static_arenas[MBD_MAX_ARENAS];
 
 static void internal_init(void) {
+    mbd_secret_key = (uint32_t)time(NULL) ^ 0x55AA55AA;
     long sc_page = sysconf(_SC_PAGESIZE);
     if (sc_page > 0) os_page_size = sc_page;
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
@@ -589,7 +604,7 @@ static void internal_init(void) {
         initial->order = MAX_ORDER;
         initial->used  = 0;
         initial->is_mmap = 0;
-        initial->magic = MAGIC_FREE;
+        initial->magic = encode_magic(initial, MAGIC_FREE);
         initial->arena = &arenas[a];
         initial->next = initial->prev = NULL;
         
@@ -645,13 +660,20 @@ static thread_cache_data_t *get_thread_cache(void) {
                     block = split_block_down(other_arena, block, order);
                     block->used  = 1;
                     block->is_mmap = 0;
-                    block->magic = MAGIC_ALLOC;
+                    block->magic = encode_magic(block, MAGIC_ALLOC);
                     block->arena = other_arena;
                     block->next = block->prev = NULL;
                     
                     data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
                     memset(data, 0, sizeof(thread_cache_data_t));
                     data->arena = other_arena;
+                    atomic_init(&data->last_active_timestamp, (uint64_t)time(NULL));
+                    atomic_init(&data->is_reaping, 0);
+#if defined(__linux__)
+                    data->kernel_tid = (pid_t)syscall(SYS_gettid);
+#else
+                    data->kernel_tid = 0;
+#endif
 
                     data->next = NULL;
                     pthread_mutex_lock(&cache_list_lock);
@@ -662,7 +684,7 @@ static thread_cache_data_t *get_thread_cache(void) {
                     
                     if (pthread_setspecific(thread_cache_key, data) != 0) {
                         block->used = 0;
-                        block->magic = MAGIC_FREE;
+                        block->magic = encode_magic(block, MAGIC_FREE);
 
                         uint32_t o = block->order;
                         block = coalesce_up_and_update(other_arena, block, &o);
@@ -685,13 +707,20 @@ static thread_cache_data_t *get_thread_cache(void) {
 
         block->used  = 1;
         block->is_mmap = 0;
-        block->magic = MAGIC_ALLOC;
+        block->magic = encode_magic(block, MAGIC_ALLOC);
         block->arena = arena;
         block->next = block->prev = NULL;
 
         data = (thread_cache_data_t *)((uint8_t*)block + HEADER_SIZE);
         memset(data, 0, sizeof(thread_cache_data_t));
         data->arena = arena;
+        atomic_init(&data->last_active_timestamp, (uint64_t)time(NULL));
+        atomic_init(&data->is_reaping, 0);
+#if defined(__linux__)
+        data->kernel_tid = (pid_t)syscall(SYS_gettid);
+#else
+        data->kernel_tid = 0;
+#endif
 
         data->next = NULL;
         pthread_mutex_lock(&cache_list_lock);
@@ -702,7 +731,7 @@ static thread_cache_data_t *get_thread_cache(void) {
 
         if (pthread_setspecific(thread_cache_key, data) != 0) {
             block->used = 0;
-            block->magic = MAGIC_FREE;
+            block->magic = encode_magic(block, MAGIC_FREE);
 
             uint32_t o = block->order;
             block = coalesce_up_and_update(arena, block, &o);
@@ -747,7 +776,7 @@ static void refill_thread_cache(thread_cache_data_t *data, uint32_t order) {
             arena_remove(arena, block, order);
         }
 
-        block->magic = MAGIC_CACHED;
+        block->magic = encode_magic(block, MAGIC_CACHED);
         block->arena = arena;
         block->next = data->cache[order];
         data->cache[order] = block;
@@ -840,7 +869,7 @@ void *mbd_alloc(size_t requested_size) {
             return NULL;
         }
         block->is_mmap = 1;
-        block->magic = MAGIC_MMAP;
+        block->magic = encode_magic(block, MAGIC_MMAP);
         block->arena = NULL;
         block->mmap_size = needed; // Store allocation size in unused prev pointer
         atomic_fetch_add(&huge_mmap_tracked, needed);
@@ -870,7 +899,7 @@ void *mbd_alloc(size_t requested_size) {
         atomic_fetch_sub(&global_cache_pressure, 1ULL << order);
         block->used  = 1;
         block->is_mmap = 0;
-        block->magic = MAGIC_ALLOC;
+        block->magic = encode_magic(block, MAGIC_ALLOC);
         data->cache_hits++;
         // Notice: We intentionally do NOT overwrite block->arena.
         block->next = block->prev = NULL;
@@ -883,7 +912,10 @@ void *mbd_alloc(size_t requested_size) {
     drain_remote_queue(arena);
 
     if (order <= SMALL_ORDER_MAX) {
-        if (data) data->cache_misses++;
+        if (data) {
+            data->cache_misses++;
+            atomic_store(&data->last_active_timestamp, (uint64_t)time(NULL));
+        }
         refill_thread_cache(data, order);
         if (data->cache[order]) {
 
@@ -894,7 +926,7 @@ void *mbd_alloc(size_t requested_size) {
         atomic_fetch_sub(&global_cache_pressure, 1ULL << order);
             block->used  = 1;
             block->is_mmap = 0;
-            block->magic = MAGIC_ALLOC;
+            block->magic = encode_magic(block, MAGIC_ALLOC);
             block->next = block->prev = NULL;
             pthread_mutex_unlock(&arena->lock);
             return (void *)((uint8_t*)block + HEADER_SIZE);
@@ -924,7 +956,7 @@ void *mbd_alloc(size_t requested_size) {
                 block = split_block_down(other_arena, block, order);
                 block->used  = 1;
                 block->is_mmap = 0;
-                block->magic = MAGIC_ALLOC;
+                block->magic = encode_magic(block, MAGIC_ALLOC);
                 block->arena = other_arena;
                 block->next = block->prev = NULL;
                 pthread_mutex_unlock(&other_arena->lock);
@@ -947,7 +979,7 @@ void *mbd_alloc(size_t requested_size) {
 
     block->used  = 1;
     block->is_mmap = 0;
-    block->magic = MAGIC_ALLOC;
+    block->magic = encode_magic(block, MAGIC_ALLOC);
     block->arena = arena;
     block->next = block->prev = NULL;
 
@@ -972,21 +1004,21 @@ void mbd_free(void *ptr) {
 
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
 
-    if (block->magic == MAGIC_MEMALIGN) {
+    if (block->magic == encode_magic(block, MAGIC_MEMALIGN)) {
         void *raw = block->prev;
-        block->magic = MAGIC_FREE; /* Defuse double-free vulnerability, but keep it MAGIC_FREE to fail consistently */
+        block->magic = encode_magic(block, MAGIC_FREE); /* Defuse double-free vulnerability, but keep it MAGIC_FREE to fail consistently */
         mbd_free(raw);
         return;
     }
 
-    if (block->is_mmap && block->magic == MAGIC_MMAP) {
+    if (block->is_mmap && block->magic == encode_magic(block, MAGIC_MMAP)) {
         size_t mmap_size = block->mmap_size;
         atomic_fetch_sub(&huge_mmap_tracked, mmap_size);
         munmap(block, mmap_size);
         return;
     }
 
-    if (block->magic != MAGIC_ALLOC) {
+    if (block->magic != encode_magic(block, MAGIC_ALLOC)) {
         fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption!\n");
         abort();
     }
@@ -1005,7 +1037,7 @@ void mbd_free(void *ptr) {
     if (order > SMALL_ORDER_MAX) {
         pthread_mutex_lock(&arena->lock);
         drain_remote_queue(arena);
-        block->magic = MAGIC_FREE;
+        block->magic = encode_magic(block, MAGIC_FREE);
 
         block = coalesce_up_and_update(arena, block, &order);
         arena_insert(arena, order, block);
@@ -1033,7 +1065,7 @@ void mbd_free(void *ptr) {
     if (!data) {
         pthread_mutex_lock(&arena->lock);
         drain_remote_queue(arena);
-        block->magic = MAGIC_FREE;
+        block->magic = encode_magic(block, MAGIC_FREE);
 
         block = coalesce_up_and_update(arena, block, &order);
         arena_insert(arena, order, block);
@@ -1045,7 +1077,7 @@ void mbd_free(void *ptr) {
 
     if (data->count[order] < THREAD_CACHE_SIZE) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << block->order);
-        block->magic = MAGIC_CACHED;
+        block->magic = encode_magic(block, MAGIC_CACHED);
 
         block->next = data->cache[order];
         data->cache[order] = block;
@@ -1057,6 +1089,7 @@ void mbd_free(void *ptr) {
 
     /* Bulk flush with grouped lock acquisition to prevent thrashing */
     data->bulk_flushes++;
+    atomic_store(&data->last_active_timestamp, (uint64_t)time(NULL));
     MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, THREAD_CACHE_SIZE / 2);
     mbd_arena_t *locked_arena = NULL;
     int flush_count = THREAD_CACHE_SIZE / 2;
@@ -1067,7 +1100,7 @@ void mbd_free(void *ptr) {
         data->cache[order] = to_global->next;
         data->count[order]--;
 
-        to_global->magic = MAGIC_FREE;
+        to_global->magic = encode_magic(to_global, MAGIC_FREE);
         mbd_arena_t *block_arena = to_global->arena;
 
         if (locked_arena != block_arena) {
@@ -1094,7 +1127,7 @@ void mbd_free(void *ptr) {
     }
     
     /* Add the target block to the now-emptied cache */
-    block->magic = MAGIC_CACHED;
+    block->magic = encode_magic(block, MAGIC_CACHED);
     block->next = data->cache[order];
     data->cache[order] = block;
     data->count[order]++;
@@ -1120,7 +1153,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
 
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
     
-    if (block->magic == MAGIC_MEMALIGN) {
+    if (block->magic == encode_magic(block, MAGIC_MEMALIGN)) {
         void *raw = block->prev;
         block_header_t *raw_block = (block_header_t *)((uint8_t*)raw - HEADER_SIZE);
         size_t old_usable = raw_block->is_mmap ? (raw_block->mmap_size - HEADER_SIZE) : ((size_t)1 << raw_block->order) - HEADER_SIZE;
@@ -1136,7 +1169,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return new_ptr;
     }
 
-    if (block->is_mmap && block->magic == MAGIC_MMAP) {
+    if (block->is_mmap && block->magic == encode_magic(block, MAGIC_MMAP)) {
         size_t old_usable = block->mmap_size - HEADER_SIZE;
         if (new_size <= old_usable) return ptr;
 
@@ -1147,9 +1180,38 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return new_ptr;
     }
 
-    if (block->magic != MAGIC_ALLOC) abort();
+    if (block->magic != encode_magic(block, MAGIC_ALLOC)) abort();
 
     size_t old_usable = ((size_t)1 << block->order) - HEADER_SIZE;
+    if (new_size <= old_usable) return ptr;
+
+    mbd_arena_t *arena = block->arena;
+    pthread_mutex_lock(&arena->lock);
+    drain_remote_queue(arena);
+
+    while (block->order < MAX_ORDER) {
+        size_t current_usable = ((size_t)1 << block->order) - HEADER_SIZE;
+        if (new_size <= current_usable) break;
+
+        block_header_t *buddy = get_buddy(arena, block, block->order);
+        if (!buddy || buddy->magic != encode_magic(buddy, MAGIC_FREE) || buddy->order != block->order || buddy->arena != arena) {
+            break;
+        }
+
+        /* Check if we are the left buddy. In-place coalesce only works if the free buddy is to our right. */
+        if ((uintptr_t)buddy < (uintptr_t)block) {
+            break;
+        }
+
+        arena_remove(arena, buddy, block->order);
+        atomic_fetch_add(&global_coalesces, 1);
+        MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, block->order);
+
+        block->order += 1;
+    }
+    pthread_mutex_unlock(&arena->lock);
+
+    old_usable = ((size_t)1 << block->order) - HEADER_SIZE;
     if (new_size <= old_usable) return ptr;
 
     void *new_ptr = mbd_alloc(new_size);
@@ -1193,7 +1255,7 @@ void *mbd_memalign(size_t alignment, size_t size) {
 
     /* Plant fake header pointing to the real allocated block for easy free-ing */
     block_header_t *fake = (block_header_t *)(aligned_addr - HEADER_SIZE);
-    fake->magic = MAGIC_MEMALIGN;
+    fake->magic = encode_magic(fake, MAGIC_MEMALIGN);
     fake->prev = (block_header_t *)raw; 
 
     return (void *)aligned_addr;
@@ -1206,12 +1268,28 @@ void *mbd_memalign(size_t alignment, size_t size) {
  * @param ptr Allocated pointer (must be valid).
  * @return size_t Usable payload size (≥ requested size).
  */
+static int is_pointer_in_any_arena(const void *ptr) {
+    uintptr_t addr = (uintptr_t)ptr;
+    for (int a = 0; a < arena_count; a++) {
+        if (arenas[a].memory_pool && addr >= (uintptr_t)arenas[a].memory_pool && addr < (uintptr_t)arenas[a].memory_pool + POOL_SIZE) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 size_t mbd_malloc_usable_size(const void *ptr) {
     if (!ptr) return 0;
 
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
 
-    if (block->magic == MAGIC_MEMALIGN) {
+    if (block->is_mmap && block->magic == encode_magic(block, MAGIC_MMAP)) {
+        return block->mmap_size - HEADER_SIZE;
+    }
+
+    if (!is_pointer_in_any_arena(block)) return 0;
+
+    if (block->magic == encode_magic(block, MAGIC_MEMALIGN)) {
         void *raw = block->prev;
         block_header_t *raw_block = (block_header_t *)((uint8_t*)raw - HEADER_SIZE);
         size_t old_usable = raw_block->is_mmap ? (raw_block->mmap_size - HEADER_SIZE) : ((size_t)1 << raw_block->order) - HEADER_SIZE;
@@ -1219,11 +1297,7 @@ size_t mbd_malloc_usable_size(const void *ptr) {
         return old_usable > offset ? old_usable - offset : 0;
     }
 
-    if (block->is_mmap && block->magic == MAGIC_MMAP) {
-        return block->mmap_size - HEADER_SIZE;
-    }
-
-    if (block->magic != MAGIC_ALLOC) return 0;
+    if (block->magic != encode_magic(block, MAGIC_ALLOC)) return 0;
     return ((size_t)1 << block->order) - HEADER_SIZE;
 }
 
@@ -1243,7 +1317,7 @@ static void flush_my_cache(thread_cache_data_t *curr) {
             curr->cache[o] = block->next;
             curr->count[o]--;
 
-            block->magic = MAGIC_FREE;
+            block->magic = encode_magic(block, MAGIC_FREE);
 
             mbd_arena_t *block_arena = block->arena;
 
@@ -1268,6 +1342,68 @@ static void flush_my_cache(thread_cache_data_t *curr) {
 
 void mbd_trim(void) {
     atomic_fetch_add(&trim_requested, 1);
+
+    /* Reaper mechanism: flush caches of threads that are genuinely dead (avoid data races with active threads) */
+    pthread_mutex_lock(&cache_list_lock);
+    thread_cache_data_t **curr_ptr = &global_cache_list;
+    while (*curr_ptr) {
+        thread_cache_data_t *curr = *curr_ptr;
+        /* Check if the thread exists using kill(kernel_tid, 0). ESRCH means it is dead. */
+        int is_dead = 0;
+#if defined(__linux__)
+        if (kill(curr->kernel_tid, 0) == -1 && errno == ESRCH) {
+            is_dead = 1;
+        }
+#endif
+        if (is_dead) {
+            /* Thread is dead but didn't clean up its cache (e.g. hard exit or quick_exit) */
+            /* Remove it from the global list */
+            *curr_ptr = curr->next;
+
+            /* Reclaim its blocks */
+            mbd_arena_t *locked_arena = NULL;
+            for (int o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {
+                block_header_t *block = curr->cache[o];
+                curr->cache[o] = NULL;
+                curr->count[o] = 0;
+                while (block) {
+                    block_header_t *next = block->next;
+                    block->magic = encode_magic(block, MAGIC_FREE);
+                    mbd_arena_t *block_arena = block->arena;
+                    if (locked_arena != block_arena) {
+                        if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+                        locked_arena = block_arena;
+                        pthread_mutex_lock(&locked_arena->lock);
+                        drain_remote_queue(locked_arena);
+                    }
+                    uint32_t coalesced_order = block->order;
+                    block = coalesce_up_and_update(locked_arena, block, &coalesced_order);
+                    arena_insert(locked_arena, coalesced_order, block);
+                    atomic_fetch_sub(&global_cached_bytes, 1ULL << o);
+                    block = next;
+                }
+            }
+            if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+
+            /* Free the cache struct itself back to its arena */
+            block_header_t *cache_block = (block_header_t *)((uint8_t*)curr - HEADER_SIZE);
+            cache_block->used = 0;
+            cache_block->magic = encode_magic(cache_block, MAGIC_FREE);
+            mbd_arena_t *cache_arena = cache_block->arena;
+
+            pthread_mutex_lock(&cache_arena->lock);
+            drain_remote_queue(cache_arena);
+            uint32_t co = cache_block->order;
+            cache_block = coalesce_up_and_update(cache_arena, cache_block, &co);
+            arena_insert(cache_arena, co, cache_block);
+            pthread_mutex_unlock(&cache_arena->lock);
+
+            atomic_fetch_sub(&active_threads, 1);
+        } else {
+            curr_ptr = &curr->next;
+        }
+    }
+    pthread_mutex_unlock(&cache_list_lock);
 }
 
 /**
