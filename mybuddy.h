@@ -444,6 +444,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     while (order < MAX_ORDER) {
         block_header_t *buddy = get_buddy(arena, block, order);
         if (!buddy || buddy->magic != encode_magic(buddy, MAGIC_FREE) || buddy->order != order || buddy->arena != arena) break;
+        if (buddy->prev == NULL && arena->free_lists[order] != buddy) break;
         arena_remove(arena, buddy, order);
         atomic_fetch_add(&arena->coalesces, 1);
         MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, order);
@@ -1085,7 +1086,6 @@ void mbd_free(void *ptr) {
         data->count[order]--;
 
         to_global->used = 0;
-        to_global->magic = encode_magic(to_global, MAGIC_FREE);
         mbd_arena_t *block_arena = to_global->arena;
 
         if (locked_arena != block_arena) {
@@ -1094,6 +1094,8 @@ void mbd_free(void *ptr) {
             pthread_mutex_lock(&locked_arena->lock);
             drain_remote_queue(locked_arena);
         }
+
+        to_global->magic = encode_magic(to_global, MAGIC_FREE);
 
         uint32_t original_order = to_global->order;
         uint32_t o = to_global->order;
@@ -1162,7 +1164,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
     }
 
     if (block->magic != encode_magic(block, MAGIC_ALLOC)) {
-        fprintf(stderr, "mbd_realloc: DOUBLE-FREE or corruption! ptr=%p block=%p magic=%x alloc=%x cached=%x free=%x\n", ptr, block, block->magic, encode_magic(block, MAGIC_ALLOC), encode_magic(block, MAGIC_CACHED), encode_magic(block, MAGIC_FREE));
+        fprintf(stderr, "mbd_realloc: DOUBLE-FREE or corruption! ptr=%p block=%p magic=%lx alloc=%lx cached=%lx free=%lx mmap=%lx\n", ptr, block, (unsigned long)block->magic, (unsigned long)encode_magic(block, MAGIC_ALLOC), (unsigned long)encode_magic(block, MAGIC_CACHED), (unsigned long)encode_magic(block, MAGIC_FREE), (unsigned long)encode_magic(block, MAGIC_MMAP));
         abort();
     }
 
@@ -1181,13 +1183,14 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         if (!buddy || buddy->magic != encode_magic(buddy, MAGIC_FREE) || buddy->order != block->order || buddy->arena != arena) {
             break;
         }
+        if (buddy->prev == NULL && arena->free_lists[block->order] != buddy) {
+            break;
+        }
 
         /* Check if we are the left buddy. In-place coalesce only works if the free buddy is to our right. */
         if ((uintptr_t)buddy < (uintptr_t)block) {
             break;
         }
-
-        block->magic = 0; buddy->magic = 0;
 
         arena_remove(arena, buddy, block->order);
         atomic_fetch_add(&arena->coalesces, 1);
@@ -1195,7 +1198,8 @@ void *mbd_realloc(void *ptr, size_t new_size) {
 
         block->order += 1;
     }
-    block->magic = encode_magic(block, MAGIC_ALLOC);
+
+    block->magic = encode_magic(block, MAGIC_ALLOC);   // ← always valid before unlock
     pthread_mutex_unlock(&arena->lock);
 
     old_usable = ((size_t)1 << block->order) - HEADER_SIZE;
@@ -1309,17 +1313,16 @@ static void flush_my_cache(thread_cache_data_t *curr) {
             curr->cache[o] = block->next;
             curr->count[o]--;
 
-            block->magic = encode_magic(block, MAGIC_FREE);
-
             mbd_arena_t *block_arena = block->arena;
 
             if (locked_arena != block_arena) {
                 if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
-                
                 locked_arena = block_arena;
                 pthread_mutex_lock(&locked_arena->lock);
                 drain_remote_queue(locked_arena);
             }
+
+            block->magic = encode_magic(block, MAGIC_FREE);
 
             uint32_t original_order = block->order;
             uint32_t coalesced_order = original_order;
