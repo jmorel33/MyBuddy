@@ -277,7 +277,7 @@ typedef struct block_header {
     _Atomic(struct mbd_arena *) arena; // 8 or 4
     _Atomic(struct block_header *) next;  // 8 or 4
     union {
-        _Atomic(struct block_header *) prev;  // 8 or 4
+        struct block_header *prev;  // 8 or 4
         size_t mmap_size;           // Used when is_mmap == 1
     };
 } block_header_t __attribute__((aligned(32)));
@@ -285,7 +285,7 @@ typedef struct block_header {
 typedef struct mbd_arena {
     pthread_mutex_t lock;
     pthread_mutex_t remote_lock;
-    _Atomic(block_header_t *) free_lists[MAX_ORDER + 1];
+    block_header_t *free_lists[MAX_ORDER + 1];
     uint8_t *memory_pool;
     struct {
         block_header_t *head;
@@ -383,22 +383,18 @@ static inline uint32_t load_magic(const block_header_t *b) {
  * ================================================================== */
 
 static void arena_insert(mbd_arena_t *arena, uint32_t order, block_header_t *block) {
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
-    block_header_t *current_head = atomic_load_explicit(&arena->free_lists[order], memory_order_relaxed);
-    atomic_store_explicit(&block->next, current_head, memory_order_relaxed);
-    if (current_head) atomic_store_explicit(&current_head->prev, block, memory_order_relaxed);
-    atomic_store_explicit(&arena->free_lists[order], block, memory_order_relaxed);
-    atomic_store_explicit(&block->arena, arena, memory_order_relaxed);
+    block->prev = NULL;
+    block->next = arena->free_lists[order];
+    if (arena->free_lists[order]) arena->free_lists[order]->prev = block;
+    arena->free_lists[order] = block;
+    block->arena = arena;
 }
 
 static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
-    block_header_t *prev = atomic_load_explicit(&block->prev, memory_order_relaxed);
-    block_header_t *next = atomic_load_explicit(&block->next, memory_order_relaxed);
-    if (prev) atomic_store_explicit(&prev->next, next, memory_order_relaxed);
-    else      atomic_store_explicit(&arena->free_lists[order], next, memory_order_relaxed);
-    if (next) atomic_store_explicit(&next->prev, prev, memory_order_relaxed);
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
-    atomic_store_explicit(&block->next, NULL, memory_order_relaxed);
+    if (block->prev) block->prev->next = block->next;
+    else             arena->free_lists[order] = block->next;
+    if (block->next) block->next->prev = block->prev;
+    block->prev = block->next = NULL;
 }
 
 /* ================================================================== *
@@ -438,20 +434,19 @@ static inline block_header_t *get_buddy(mbd_arena_t *arena, block_header_t *bloc
 }
 
 static block_header_t* split_block_down(mbd_arena_t *arena, block_header_t *block, uint32_t target_order) {
-    uint32_t orig_order = atomic_load_explicit(&block->order, memory_order_relaxed);
-    while (atomic_load_explicit(&block->order, memory_order_relaxed) > target_order) {
-        uint32_t new_order = atomic_load_explicit(&block->order, memory_order_relaxed) - 1;
+    uint32_t orig_order = block->order;
+    while (block->order > target_order) {
+        uint32_t new_order = block->order - 1;
         block_header_t *buddy = get_buddy(arena, block, new_order);
-        atomic_store_explicit(&buddy->order, new_order, memory_order_relaxed);
+        buddy->order = new_order;
         buddy->used  = 0;
         buddy->is_mmap = 0;
         buddy->magic = encode_magic(buddy, MAGIC_FREE);
 
-        atomic_store_explicit(&buddy->arena, arena, memory_order_relaxed);
-        atomic_store_explicit(&buddy->next, NULL, memory_order_relaxed);
-        atomic_store_explicit(&buddy->prev, NULL, memory_order_relaxed);
+        buddy->arena = arena;
+        buddy->next = buddy->prev = NULL;
         arena_insert(arena, new_order, buddy);
-        atomic_store_explicit(&block->order, new_order, memory_order_relaxed);
+        block->order = new_order;
     }
     atomic_fetch_add(&arena->splits, orig_order - target_order);
     MBD_FIRE_EVENT(MBD_EVENT_SPLIT, block, orig_order - target_order);
@@ -470,7 +465,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
             atomic_load_explicit(&buddy->arena, memory_order_acquire) != arena)
             break;
 
-        if (atomic_load_explicit(&buddy->prev, memory_order_relaxed) == NULL && atomic_load_explicit(&arena->free_lists[order], memory_order_relaxed) != buddy)
+        if (buddy->prev == NULL && arena->free_lists[order] != buddy)
             break;
             
         arena_remove(arena, buddy, order);
@@ -478,7 +473,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
         MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, order);
 
         if ((uintptr_t)block > (uintptr_t)buddy) block = buddy;
-        atomic_store_explicit(&block->order, order + 1, memory_order_relaxed);
+        block->order = order + 1;
         order++;
     }
     /* Safe madvise: Only advise the payload pages, preserving the header page */
@@ -538,7 +533,7 @@ static void thread_cache_destructor(void *arg) {
     thread_cache_data_t **curr = &global_cache_list;
     while (*curr) {
         if (*curr == data) {
-            *curr = atomic_load_explicit(&data->next, memory_order_relaxed);
+            *curr = data->next;
             break;
         }
         curr = &(*curr)->next;
@@ -550,9 +545,9 @@ static void thread_cache_destructor(void *arg) {
     for (int o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {
         while (data->cache[o]) {
             block_header_t *block = data->cache[o];
-            data->cache[o] = atomic_load_explicit(&block->next, memory_order_relaxed);
+            data->cache[o] = block->next;
             
-            mbd_arena_t *block_arena = atomic_load_explicit(&block->arena, memory_order_relaxed);
+            mbd_arena_t *block_arena = block->arena;
 
             block->used = 0;
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
@@ -562,7 +557,7 @@ static void thread_cache_destructor(void *arg) {
 
             if (atomic_load(&block_arena->active)) {
                 pthread_mutex_lock(&block_arena->remote_lock);
-                atomic_store_explicit(&block->next, block_arena->remote_free_queue.head, memory_order_relaxed);
+                block->next = block_arena->remote_free_queue.head;
                 atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
                 block_arena->remote_free_queue.head = block;
                 pthread_mutex_unlock(&block_arena->remote_lock);
@@ -574,11 +569,11 @@ static void thread_cache_destructor(void *arg) {
     block_header_t *cache_block = (block_header_t *)((uint8_t*)data - HEADER_SIZE);
     cache_block->used = 0;
     cache_block->magic = encode_magic(cache_block, MAGIC_FREE);
-    mbd_arena_t *cache_arena = atomic_load_explicit(&cache_block->arena, memory_order_relaxed);
+    mbd_arena_t *cache_arena = cache_block->arena;
 
     if (atomic_load(&cache_arena->active)) {
         pthread_mutex_lock(&cache_arena->remote_lock);
-        atomic_store_explicit(&cache_block->next, cache_arena->remote_free_queue.head, memory_order_relaxed);
+        cache_block->next = cache_arena->remote_free_queue.head;
         atomic_store_explicit(&cache_block->magic, encode_magic(cache_block, MAGIC_FREE), memory_order_release);
         cache_arena->remote_free_queue.head = cache_block;
         pthread_mutex_unlock(&cache_arena->remote_lock);
@@ -614,7 +609,7 @@ static void internal_init(void) {
         atomic_init(&arenas[a].splits, 0);
         atomic_init(&arenas[a].coalesces, 0);
         atomic_init(&arenas[a].active, 1);
-        for (int i = 0; i <= MAX_ORDER; i++) atomic_store_explicit(&arenas[a].free_lists[i], NULL, memory_order_relaxed);
+        for (int i = 0; i <= MAX_ORDER; i++) arenas[a].free_lists[i] = NULL;
         
         arenas[a].memory_pool = (uint8_t *)mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (arenas[a].memory_pool == MAP_FAILED) abort();
@@ -626,15 +621,14 @@ static void internal_init(void) {
 #endif
 
         block_header_t *initial = (block_header_t *)arenas[a].memory_pool;
-        atomic_store_explicit(&initial->order, MAX_ORDER, memory_order_relaxed);
+        initial->order = MAX_ORDER;
         initial->used  = 0;
         initial->is_mmap = 0;
         atomic_store_explicit(&initial->magic, encode_magic(initial, MAGIC_FREE), memory_order_release);
-        atomic_store_explicit(&initial->arena, &arenas[a], memory_order_relaxed);
-        atomic_store_explicit(&initial->next, NULL, memory_order_relaxed);
-        atomic_store_explicit(&initial->prev, NULL, memory_order_relaxed);
+        initial->arena = &arenas[a];
+        initial->next = initial->prev = NULL;
         
-        atomic_store_explicit(&arenas[a].free_lists[MAX_ORDER], initial, memory_order_relaxed);
+        arenas[a].free_lists[MAX_ORDER] = initial;
     }
 
     pthread_key_create(&thread_cache_key, thread_cache_destructor);
@@ -666,22 +660,21 @@ static thread_cache_data_t *get_thread_cache(void) {
         uint32_t order  = next_power_of_two_order(needed);
         uint32_t cur = order;
 
-        while (cur <= MAX_ORDER && !atomic_load_explicit(&arena->free_lists[cur], memory_order_relaxed)) cur++;
+        while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
         
         block_header_t *block = NULL;
         mbd_arena_t *target_arena = arena;
 
         if (cur <= MAX_ORDER) {
-            block = atomic_load_explicit(&arena->free_lists[cur], memory_order_relaxed);
+            block = arena->free_lists[cur];
             arena_remove(arena, block, cur);
             block = split_block_down(arena, block, order);
             
             block->used  = 1;
             block->is_mmap = 0;
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-            atomic_store_explicit(&block->arena, arena, memory_order_relaxed);
-            atomic_store_explicit(&block->next, NULL, memory_order_relaxed);
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
+            block->arena = arena;
+            block->next = block->prev = NULL;
 
             pthread_mutex_unlock(&arena->lock);
         } else {
@@ -695,19 +688,18 @@ static thread_cache_data_t *get_thread_cache(void) {
                 pthread_mutex_lock(&other_arena->lock);
                 drain_remote_queue(other_arena);
                 cur = order;
-                while (cur <= MAX_ORDER && !atomic_load_explicit(&other_arena->free_lists[cur], memory_order_relaxed)) cur++;
+                while (cur <= MAX_ORDER && !other_arena->free_lists[cur]) cur++;
                 
                 if (cur <= MAX_ORDER) {
-                    block = atomic_load_explicit(&other_arena->free_lists[cur], memory_order_relaxed);
+                    block = other_arena->free_lists[cur];
                     arena_remove(other_arena, block, cur);
                     block = split_block_down(other_arena, block, order);
                     
                     block->used  = 1;
                     block->is_mmap = 0;
                     atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-                    atomic_store_explicit(&block->arena, other_arena, memory_order_relaxed);
-                    atomic_store_explicit(&block->next, NULL, memory_order_relaxed);
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
+                    block->arena = other_arena;
+                    block->next = block->prev = NULL;
 
                     target_arena = other_arena;
                     pthread_mutex_unlock(&other_arena->lock);
@@ -732,7 +724,7 @@ static thread_cache_data_t *get_thread_cache(void) {
             block->used = 0;
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
 
-            uint32_t o = atomic_load_explicit(&block->order, memory_order_relaxed);
+            uint32_t o = block->order;
             block = coalesce_up_and_update(target_arena, block, &o);
             arena_insert(target_arena, o, block);
             pthread_mutex_unlock(&target_arena->lock);
@@ -764,15 +756,15 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
     uint32_t limit = get_cache_limit(order);
     while (data->count[order] < limit) {
 
-        block_header_t *block = atomic_load_explicit(&locked_arena->free_lists[order], memory_order_relaxed);
+        block_header_t *block = locked_arena->free_lists[order];
         if (!block) {
             uint32_t cur = order + 1;
-            while (cur <= MAX_ORDER && !atomic_load_explicit(&locked_arena->free_lists[cur], memory_order_relaxed)) cur++;
+            while (cur <= MAX_ORDER && !locked_arena->free_lists[cur]) cur++;
             if (cur > MAX_ORDER) {
                 break;
             }
 
-            block = atomic_load_explicit(&locked_arena->free_lists[cur], memory_order_relaxed);
+            block = locked_arena->free_lists[cur];
             arena_remove(locked_arena, block, cur);
             block = split_block_down(locked_arena, block, order);
         } else {
@@ -780,8 +772,8 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
         }
 
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
-        atomic_store_explicit(&block->arena, locked_arena, memory_order_relaxed);
-        atomic_store_explicit(&block->next, data->cache[order], memory_order_relaxed);
+        block->arena = locked_arena;
+        block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
         atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << order);
@@ -894,7 +886,7 @@ void *mbd_alloc(size_t requested_size) {
 #endif
         block->is_mmap = 1;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_MMAP), memory_order_release);
-        atomic_store_explicit(&block->arena, NULL, memory_order_relaxed);
+        block->arena = NULL;
         block->mmap_size = needed; // Store allocation size in unused prev pointer
         atomic_fetch_add(&huge_mmap_tracked, needed);
         void *res = (void *)((uint8_t*)block + HEADER_SIZE);
@@ -917,7 +909,7 @@ void *mbd_alloc(size_t requested_size) {
 
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
         block_header_t *block = data->cache[order];
-        data->cache[order] = atomic_load_explicit(&block->next, memory_order_relaxed);
+        data->cache[order] = block->next;
         data->count[order]--;
         atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
         atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
@@ -925,9 +917,8 @@ void *mbd_alloc(size_t requested_size) {
         block->is_mmap = 0;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
         data->cache_hits++;
-        // Notice: We intentionally do NOT overwrite atomic_load_explicit(&block->arena, memory_order_relaxed).
-        atomic_store_explicit(&block->next, NULL, memory_order_relaxed);
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
+        // Notice: We intentionally do NOT overwrite block->arena.
+        block->next = block->prev = NULL;
         void *res = (void *)((uint8_t*)block + HEADER_SIZE);
         MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
         return res;
@@ -944,15 +935,14 @@ void *mbd_alloc(size_t requested_size) {
         if (data->cache[order]) {
 
             block_header_t *block = data->cache[order];
-            data->cache[order] = atomic_load_explicit(&block->next, memory_order_relaxed);
+            data->cache[order] = block->next;
             data->count[order]--;
             atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
             atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
             block->used  = 1;
             block->is_mmap = 0;
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-            atomic_store_explicit(&block->next, NULL, memory_order_relaxed);
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
+            block->next = block->prev = NULL;
             pthread_mutex_unlock(&arena->lock);
             void *res = (void *)((uint8_t*)block + HEADER_SIZE);
             MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
@@ -962,7 +952,7 @@ void *mbd_alloc(size_t requested_size) {
 
     /* Global slow path */
     uint32_t cur = order;
-    while (cur <= MAX_ORDER && !atomic_load_explicit(&arena->free_lists[cur], memory_order_relaxed)) cur++;
+    while (cur <= MAX_ORDER && !arena->free_lists[cur]) cur++;
     
     if (cur > MAX_ORDER) {
         pthread_mutex_unlock(&arena->lock);
@@ -975,18 +965,17 @@ void *mbd_alloc(size_t requested_size) {
             pthread_mutex_lock(&other_arena->lock);
             drain_remote_queue(other_arena);
             cur = order;
-            while (cur <= MAX_ORDER && !atomic_load_explicit(&other_arena->free_lists[cur], memory_order_relaxed)) cur++;
+            while (cur <= MAX_ORDER && !other_arena->free_lists[cur]) cur++;
             
             if (cur <= MAX_ORDER) {
-                block = atomic_load_explicit(&other_arena->free_lists[cur], memory_order_relaxed);
+                block = other_arena->free_lists[cur];
                 arena_remove(other_arena, block, cur);
                 block = split_block_down(other_arena, block, order);
                 block->used  = 1;
                 block->is_mmap = 0;
                 atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-                atomic_store_explicit(&block->arena, other_arena, memory_order_relaxed);
-                atomic_store_explicit(&block->next, NULL, memory_order_relaxed);
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
+                block->arena = other_arena;
+                block->next = block->prev = NULL;
                 pthread_mutex_unlock(&other_arena->lock);
 
                 /* NEW: Migrate thread to the arena that actually has memory */
@@ -1008,16 +997,15 @@ void *mbd_alloc(size_t requested_size) {
         return NULL;
     }
 
-    block_header_t *block = atomic_load_explicit(&arena->free_lists[cur], memory_order_relaxed);
+    block_header_t *block = arena->free_lists[cur];
     arena_remove(arena, block, cur);
     block = split_block_down(arena, block, order);
 
     block->used  = 1;
     block->is_mmap = 0;
     atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-    atomic_store_explicit(&block->arena, arena, memory_order_relaxed);
-    atomic_store_explicit(&block->next, NULL, memory_order_relaxed);
-    atomic_store_explicit(&block->prev, NULL, memory_order_relaxed);
+    block->arena = arena;
+    block->next = block->prev = NULL;
 
     pthread_mutex_unlock(&arena->lock);
     void *res = (void *)((uint8_t*)block + HEADER_SIZE);
@@ -1043,7 +1031,7 @@ void mbd_free(void *ptr) {
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
 
     if (load_magic(block) == encode_magic(block, MAGIC_MEMALIGN)) {
-        void *raw = atomic_load_explicit(&block->prev, memory_order_relaxed);
+        void *raw = block->prev;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release); /* Defuse double-free vulnerability, but keep it MAGIC_FREE to fail consistently */
         mbd_free(raw);
         return;
@@ -1061,7 +1049,7 @@ void mbd_free(void *ptr) {
         abort();
     }
 
-    mbd_arena_t *arena = atomic_load_explicit(&block->arena, memory_order_relaxed);
+    mbd_arena_t *arena = block->arena;
     if (!arena || arena < arenas || arena >= arenas + arena_count) abort();
     if ((uintptr_t)ptr < (uintptr_t)arena->memory_pool + HEADER_SIZE ||
         (uintptr_t)ptr >= (uintptr_t)arena->memory_pool + POOL_SIZE) {
@@ -1069,7 +1057,7 @@ void mbd_free(void *ptr) {
     }
 
     block->used = 0;
-    uint32_t order = atomic_load_explicit(&block->order, memory_order_relaxed);
+    uint32_t order = block->order;
 
     /* Large blocks bypass cache and go straight to global pool */
     if (order > SMALL_ORDER_MAX) {
@@ -1091,13 +1079,12 @@ void mbd_free(void *ptr) {
     }
 
     /* Remote free queue push if we are on foreign thread cache */
-    mbd_arena_t *block_arena = atomic_load_explicit(&block->arena, memory_order_relaxed);
-    if (data && block_arena != atomic_load(&data->arena)) {
-        pthread_mutex_lock(&block_arena->remote_lock);
-        atomic_store_explicit(&block->next, block_arena->remote_free_queue.head, memory_order_relaxed);
+    if (data && block->arena != atomic_load(&data->arena)) {
+        pthread_mutex_lock(&block->arena->remote_lock);
+        block->next = block->arena->remote_free_queue.head;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
-        block_arena->remote_free_queue.head = block;
-        pthread_mutex_unlock(&block_arena->remote_lock);
+        block->arena->remote_free_queue.head = block;
+        pthread_mutex_unlock(&block->arena->remote_lock);
         return;
     }
 
@@ -1117,14 +1104,14 @@ void mbd_free(void *ptr) {
 
     uint32_t limit = get_cache_limit(order);
     if (data->count[order] < limit) {
-        MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << atomic_load_explicit(&block->order, memory_order_relaxed));
+        MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << block->order);
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
 
-        atomic_store_explicit(&block->next, data->cache[order], memory_order_relaxed);
+        block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
-        atomic_fetch_add(&atomic_load_explicit(&block->arena, memory_order_relaxed)->cached_bytes, 1ULL << order);
-        atomic_fetch_add(&atomic_load_explicit(&block->arena, memory_order_relaxed)->cache_pressure, 1ULL << order);
+        atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+        atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
         return;
     }
 
@@ -1136,11 +1123,11 @@ void mbd_free(void *ptr) {
     if (atomic_load(&data->arena->cache_pressure) > POOL_SIZE / 4) { flush_count = (limit * 3) / 4; }
     while (flush_count-- > 0 && data->cache[order]) {
         block_header_t *to_global = data->cache[order];
-        data->cache[order] = atomic_load_explicit(&to_global->next, memory_order_relaxed);
+        data->cache[order] = to_global->next;
         data->count[order]--;
 
         to_global->used = 0;
-        mbd_arena_t *block_arena = atomic_load_explicit(&to_global->arena, memory_order_relaxed);
+        mbd_arena_t *block_arena = to_global->arena;
 
         if (locked_arena != block_arena) {
             if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
@@ -1151,8 +1138,8 @@ void mbd_free(void *ptr) {
 
         atomic_store_explicit(&to_global->magic, encode_magic(to_global, MAGIC_FREE), memory_order_release);
 
-        uint32_t original_order = atomic_load_explicit(&to_global->order, memory_order_relaxed);
-        uint32_t o = atomic_load_explicit(&to_global->order, memory_order_relaxed);
+        uint32_t original_order = to_global->order;
+        uint32_t o = to_global->order;
         to_global = coalesce_up_and_update(locked_arena, to_global, &o);
         arena_insert(locked_arena, o, to_global);
         atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
@@ -1165,11 +1152,11 @@ void mbd_free(void *ptr) {
 
     /* Add the target block to the now-emptied cache */
     atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
-    atomic_store_explicit(&block->next, data->cache[order], memory_order_relaxed);
+    block->next = data->cache[order];
     data->cache[order] = block;
     data->count[order]++;
-    atomic_fetch_add(&atomic_load_explicit(&block->arena, memory_order_relaxed)->cached_bytes, 1ULL << order);
-    atomic_fetch_add(&atomic_load_explicit(&block->arena, memory_order_relaxed)->cache_pressure, 1ULL << order);
+    atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+    atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
 }
 
 /**
@@ -1191,10 +1178,10 @@ void *mbd_realloc(void *ptr, size_t new_size) {
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
 
     if (load_magic(block) == encode_magic(block, MAGIC_MEMALIGN)) {
-        void *raw = atomic_load_explicit(&block->prev, memory_order_relaxed);
+        void *raw = block->prev;
         block_header_t *raw_block = (block_header_t *)((uint8_t*)raw - HEADER_SIZE);
         size_t old_usable = raw_block->is_mmap ? (raw_block->mmap_size - HEADER_SIZE)
-                                               : ((size_t)1 << atomic_load_explicit(&raw_block->order, memory_order_relaxed)) - HEADER_SIZE;
+                                               : ((size_t)1 << raw_block->order) - HEADER_SIZE;
         size_t offset = (uint8_t*)ptr - (uint8_t*)raw;
         size_t actual_usable = old_usable - offset;
         if (new_size <= actual_usable) return ptr;
@@ -1223,38 +1210,38 @@ void *mbd_realloc(void *ptr, size_t new_size) {
     if (new_size <= old_usable) return ptr;
 
     /* Try in-place coalescing first */
-    mbd_arena_t *arena = atomic_load_explicit(&block->arena, memory_order_relaxed);
+    mbd_arena_t *arena = block->arena;
     pthread_mutex_lock(&arena->lock);
     drain_remote_queue(arena);
 
-    while (atomic_load_explicit(&block->order, memory_order_relaxed) < MAX_ORDER) {
-        size_t current_usable = ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
+    while (block->order < MAX_ORDER) {
+        size_t current_usable = ((size_t)1 << block->order) - HEADER_SIZE;
         if (new_size <= current_usable) break;
 
-        block_header_t *buddy = get_buddy(arena, block, atomic_load_explicit(&block->order, memory_order_relaxed));
+        block_header_t *buddy = get_buddy(arena, block, block->order);
         if (!buddy ||
             load_magic(buddy) != encode_magic(buddy, MAGIC_FREE) ||
-            atomic_load_explicit(&buddy->order, memory_order_acquire) != atomic_load_explicit(&block->order, memory_order_relaxed) ||
+            atomic_load_explicit(&buddy->order, memory_order_acquire) != block->order ||
             atomic_load_explicit(&buddy->arena, memory_order_acquire) != arena)
             break;
 
-        if (atomic_load_explicit(&buddy->prev, memory_order_relaxed) == NULL && atomic_load_explicit(&arena->free_lists[atomic_load_explicit(&block->order, memory_order_relaxed)], memory_order_relaxed) != buddy)
+        if (buddy->prev == NULL && arena->free_lists[block->order] != buddy)
             break;
 
         /* Only coalesce if buddy is to our right (we are left buddy) */
         if ((uintptr_t)buddy < (uintptr_t)block) break;
 
-        arena_remove(arena, buddy, atomic_load_explicit(&block->order, memory_order_relaxed));
+        arena_remove(arena, buddy, block->order);
         atomic_fetch_add(&arena->coalesces, 1);
-        MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, atomic_load_explicit(&block->order, memory_order_relaxed));
+        MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, block->order);
 
-        atomic_store_explicit(&block->order, atomic_load_explicit(&block->order, memory_order_relaxed) + 1, memory_order_relaxed);
+        block->order += 1;
     }
     
     atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
     pthread_mutex_unlock(&arena->lock);
 
-    old_usable = ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
+    old_usable = ((size_t)1 << block->order) - HEADER_SIZE;
     if (new_size <= old_usable) return ptr;
 
     /* Fall back to allocate + copy */
@@ -1304,7 +1291,7 @@ void *mbd_memalign(size_t alignment, size_t size) {
     /* Plant fake header pointing to the real allocated block for easy free-ing */
     block_header_t *fake = (block_header_t *)(aligned_addr - HEADER_SIZE);
     fake->magic = encode_magic(fake, MAGIC_MEMALIGN);
-    atomic_store_explicit(&fake->prev, (block_header_t *)raw, memory_order_relaxed);
+    fake->prev = (block_header_t *)raw;
 
     return (void *)aligned_addr;
 }
@@ -1338,15 +1325,15 @@ size_t mbd_malloc_usable_size(const void *ptr) {
     if (!is_pointer_in_any_arena(block)) return 0;
 
     if (load_magic(block) == encode_magic(block, MAGIC_MEMALIGN)) {
-        void *raw = atomic_load_explicit(&block->prev, memory_order_relaxed);
+        void *raw = block->prev;
         block_header_t *raw_block = (block_header_t *)((uint8_t*)raw - HEADER_SIZE);
-        size_t old_usable = raw_block->is_mmap ? (raw_block->mmap_size - HEADER_SIZE) : ((size_t)1 << atomic_load_explicit(&raw_block->order, memory_order_relaxed)) - HEADER_SIZE;
+        size_t old_usable = raw_block->is_mmap ? (raw_block->mmap_size - HEADER_SIZE) : ((size_t)1 << raw_block->order) - HEADER_SIZE;
         size_t offset = (const uint8_t*)ptr - (uint8_t*)raw;
         return old_usable > offset ? old_usable - offset : 0;
     }
 
     if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) return 0;
-    return ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
+    return ((size_t)1 << block->order) - HEADER_SIZE;
 }
 
 
@@ -1362,10 +1349,10 @@ static void flush_my_cache(thread_cache_data_t *curr) {
     for (int o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {
         while (curr->cache[o]) {
             block_header_t *block = curr->cache[o];
-            curr->cache[o] = atomic_load_explicit(&block->next, memory_order_relaxed);
+            curr->cache[o] = block->next;
             curr->count[o]--;
 
-            mbd_arena_t *block_arena = atomic_load_explicit(&block->arena, memory_order_relaxed);
+            mbd_arena_t *block_arena = block->arena;
 
             if (locked_arena != block_arena) {
                 if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
@@ -1376,7 +1363,7 @@ static void flush_my_cache(thread_cache_data_t *curr) {
 
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
 
-            uint32_t original_order = atomic_load_explicit(&block->order, memory_order_relaxed);
+            uint32_t original_order = block->order;
             uint32_t coalesced_order = original_order;
             block = coalesce_up_and_update(locked_arena, block, &coalesced_order);
             arena_insert(locked_arena, coalesced_order, block);
@@ -1407,7 +1394,7 @@ mbd_stats_t mbd_get_stats(void) {
             pthread_mutex_lock(&arenas[a].lock);
             drain_remote_queue(&arenas[a]);
             for (int i = MIN_ORDER; i <= MAX_ORDER; i++) {
-                for (block_header_t *b = atomic_load_explicit(&arenas[a].free_lists[i], memory_order_relaxed); b; b = atomic_load_explicit(&b->next, memory_order_relaxed)) {
+                for (block_header_t *b = arenas[a].free_lists[i]; b; b = b->next) {
                     s.total_free_bytes += (1ULL << i);
                 }
             }
@@ -1421,7 +1408,7 @@ mbd_stats_t mbd_get_stats(void) {
     s.total_allocated_bytes = s.total_mapped_bytes - s.total_free_bytes - s.total_cached_bytes;
 
     pthread_mutex_lock(&cache_list_lock);
-    for (thread_cache_data_t *curr = global_cache_list; curr; curr = atomic_load_explicit(&curr->next, memory_order_relaxed)) {
+    for (thread_cache_data_t *curr = global_cache_list; curr; curr = curr->next) {
         s.cache_hits += curr->cache_hits;
         s.cache_misses += curr->cache_misses;
         s.bulk_flushes += curr->bulk_flushes;
@@ -1442,7 +1429,7 @@ void mbd_dump(void) {
         printf("\n=== Arena %d Free Lists ===\n", a);
         for (int i = MIN_ORDER; i <= MAX_ORDER; i++) {
             int count = 0;
-            for (block_header_t *b = atomic_load_explicit(&arenas[a].free_lists[i], memory_order_relaxed); b; b = atomic_load_explicit(&b->next, memory_order_relaxed)) count++;
+            for (block_header_t *b = arenas[a].free_lists[i]; b; b = b->next) count++;
             if (count) printf("Order %2d (%8zu B) : %3d free\n", i, (size_t)1<<i, count);
         }
         printf("==================================\n\n");
