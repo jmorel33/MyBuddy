@@ -2,8 +2,8 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.0
- * @date April 11, 2026
+ * @version 1.4.1
+ * @date April 13, 2026
  * @author Jacques Morel
  *
  * @section overview Overview
@@ -365,6 +365,15 @@ static inline uint32_t encode_magic(void *block, uint32_t magic) {
     return magic ^ addr_hash ^ mbd_secret_key;
 }
 
+static void mbd_init_secret_key(void) {
+#if defined(__linux__)
+    if (syscall(SYS_getrandom, &mbd_secret_key, sizeof(mbd_secret_key), 0) == sizeof(mbd_secret_key))
+        return;
+#endif
+    mbd_secret_key = (uint32_t)(uintptr_t)&mbd_secret_key ^ (uint32_t)time(NULL) ^ 0x55AA55AA;
+}
+
+
 static inline uint32_t load_magic(const block_header_t *b) {
     return atomic_load_explicit((_Atomic(uint32_t)*)&b->magic, memory_order_acquire);
 }
@@ -582,10 +591,10 @@ static void thread_cache_destructor(void *arg) {
 static mbd_arena_t static_arenas[MBD_MAX_ARENAS];
 
 static void internal_init(void) {
-    mbd_secret_key = (uint32_t)time(NULL) ^ 0x55AA55AA;
     long sc_page = sysconf(_SC_PAGESIZE);
     if (sc_page > 0) os_page_size = sc_page;
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    mbd_init_secret_key();
     arena_count = (cores > 0) ? (2 * cores) : 2;
     if (arena_count > MBD_MAX_ARENAS) arena_count = MBD_MAX_ARENAS;
 
@@ -856,6 +865,11 @@ void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t)) {
 void *mbd_alloc(size_t requested_size) {
 
     if (requested_size == 0) requested_size = 1;
+
+    if (requested_size > SIZE_MAX - HEADER_SIZE) {
+        handle_oom();
+        return NULL;
+    }
     size_t needed = requested_size + HEADER_SIZE;
 
     /* Fallback to direct mmap for gigantic allocations (> 128 MB) */
@@ -1009,6 +1023,8 @@ void *mbd_alloc(size_t requested_size) {
 void mbd_free(void *ptr) {
 
     if (!ptr) return;
+
+    if (atomic_load(&fully_destroyed)) return;   // prevent use-after-destroy
 
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
 
@@ -1186,9 +1202,9 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return new_ptr;
     }
 
-    if (block->magic != encode_magic(block, MAGIC_ALLOC)) abort();
+    if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) abort();
 
-    size_t old_usable = ((size_t)1 << block->order) - HEADER_SIZE;
+    size_t old_usable = ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
     if (new_size <= old_usable) return ptr;
 
     /* Try in-place coalescing first */
@@ -1201,7 +1217,10 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         if (new_size <= current_usable) break;
 
         block_header_t *buddy = get_buddy(arena, block, block->order);
-        if (!buddy || buddy->magic != encode_magic(buddy, MAGIC_FREE) || buddy->order != block->order || buddy->arena != arena)
+        if (!buddy ||
+            load_magic(buddy) != encode_magic(buddy, MAGIC_FREE) ||
+            atomic_load_explicit(&buddy->order, memory_order_acquire) != block->order ||
+            atomic_load_explicit(&buddy->arena, memory_order_acquire) != arena)
             break;
 
         if (buddy->prev == NULL && arena->free_lists[block->order] != buddy)
