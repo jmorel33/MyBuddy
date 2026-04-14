@@ -772,12 +772,11 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
         }
 
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
-        atomic_store_explicit(&block->arena, locked_arena, memory_order_release);
-        atomic_store_explicit(&block->next, data->cache[order], memory_order_release);
+        block->arena = locked_arena;
+        block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
         atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << order);
-        atomic_fetch_add(&locked_arena->cache_pressure, 1ULL << order);
     }
 }
 
