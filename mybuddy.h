@@ -455,6 +455,9 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
             atomic_load_explicit(&buddy->order, memory_order_acquire) != order ||
             atomic_load_explicit(&buddy->arena, memory_order_acquire) != arena)
             break;
+
+        if (buddy->prev == NULL && arena->free_lists[order] != buddy)
+            break;
             
         arena_remove(arena, buddy, order);
         atomic_fetch_add(&arena->coalesces, 1);
@@ -1199,6 +1202,9 @@ void *mbd_realloc(void *ptr, size_t new_size) {
 
         block_header_t *buddy = get_buddy(arena, block, block->order);
         if (!buddy || buddy->magic != encode_magic(buddy, MAGIC_FREE) || buddy->order != block->order || buddy->arena != arena)
+            break;
+
+        if (buddy->prev == NULL && arena->free_lists[block->order] != buddy)
             break;
 
         /* Only coalesce if buddy is to our right (we are left buddy) */
