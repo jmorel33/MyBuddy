@@ -2,7 +2,7 @@
   <img src="MyBuddy.jpg" alt="K-Term Logo" width="1024">
 </div>
 
-**High-performance lock-free thread-caching buddy allocator for C/C++.**
+**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.1)
 
 MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high-performance C/C++ applications. It combines the anti-fragmentation guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching. It is designed with 32-byte SIMD-safe alignment, zero thread-exit leaks, hardened safety, and is LD_PRELOAD-ready.
 
