@@ -89,7 +89,17 @@ int main() {
 }
 ```
 
+### Cross-thread Stress testing
+If you want to run extensive tests with multithreaded extreme load cases, the test suite includes `test_extreme_stress` and `test_cross_thread_stress` covering TSAN / ASAN validation on 16 threads cross-freeing millions of blocks dynamically.
+
+Use `make test` inside the project to automatically run the suite!
+
 *Note: The allocator is self-initializing. The first call to `mbd_alloc()` or `mbd_free()` will automatically initialize the pool. For latency-sensitive applications, you may still call `mbd_init()` explicitly during startup.*
+
+## Recent Changes (1.4.0)
+- Safely synchronized concurrent block checks without taking locks by selectively introducing explicit `_Atomic` visibility across `block_header_t`.
+- Removed all ThreadSanitizer (TSAN) race reports related to `coalesce_up_and_update` crossing paths with dead thread cache `remote_free_queue` flushes.
+- Included `test_extreme_stress.c` and `test_cross_thread_stress.c` for deep concurrent validation.
 
 ## Recent Changes (1.3.3)
 - Fixed false sharing by migrating heavily contended global statistic atomic variables to 64-byte aligned per-arena structs.
