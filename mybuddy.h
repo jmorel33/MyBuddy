@@ -156,7 +156,7 @@ void *mbd_memalign(size_t alignment, size_t size);
  *        (Useful for string buffers, growing vectors, etc.)
  *
  * @param ptr Allocated pointer (must be valid).
- * @return size_t Usable payload size (â‰¥ requested size).
+ * @return size_t Usable payload size (>= requested size).
  */
 size_t mbd_malloc_usable_size(const void *ptr);
 
@@ -779,7 +779,6 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
         block->arena = locked_arena;
         block->next = data->cache[order];
         data->cache[order] = block;
-        atomic_signal_fence(memory_order_release);
         data->count[order]++;
         atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << order);
     }
@@ -916,7 +915,6 @@ void *mbd_alloc(size_t requested_size) {
 
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
         block_header_t *block = data->cache[order];
-        atomic_signal_fence(memory_order_acquire);
         data->cache[order] = block->next;
         data->count[order]--;
         atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
@@ -1117,7 +1115,6 @@ void mbd_free(void *ptr) {
 
         block->next = data->cache[order];
         data->cache[order] = block;
-        atomic_signal_fence(memory_order_release);
         data->count[order]++;
         atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
         atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
@@ -1165,7 +1162,6 @@ void mbd_free(void *ptr) {
     atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
     block->next = data->cache[order];
     data->cache[order] = block;
-    atomic_signal_fence(memory_order_release);
     data->count[order]++;
     atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
     atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
@@ -1336,7 +1332,7 @@ static int is_pointer_in_any_arena(const void *ptr) {
  *        (Useful for string buffers, growing vectors, etc.)
  *
  * @param ptr Allocated pointer (must be valid).
- * @return size_t Usable payload size (â‰¥ requested size).
+ * @return size_t Usable payload size (>= requested size).
  */
 size_t mbd_malloc_usable_size(const void *ptr) {
     if (!ptr) return 0;
