@@ -1275,6 +1275,13 @@ void *mbd_calloc(size_t nmemb, size_t size) {
     return ptr;
 }
 
+/**
+ * @brief Allocates memory with a specific alignment.
+ *
+ * @param alignment The required alignment (must be a power of two).
+ * @param size      The size of memory requested in bytes.
+ * @return void* Pointer to the aligned payload, or NULL on failure.
+ */
 void *mbd_memalign(size_t alignment, size_t size) {
     if (alignment == 0 || (alignment & (alignment - 1)) != 0) return NULL;
     if (alignment <= 32) return mbd_alloc(size); // Naturally 32-byte aligned
@@ -1297,11 +1304,10 @@ void *mbd_memalign(size_t alignment, size_t size) {
 }
 
 /**
- * @brief Returns the number of bytes actually usable in an allocated block.
- *        (Useful for string buffers, growing vectors, etc.)
+ * @brief Checks if a given pointer falls within the memory range of any active arena.
  *
- * @param ptr Allocated pointer (must be valid).
- * @return size_t Usable payload size (â‰¥ requested size).
+ * @param ptr The pointer to verify.
+ * @return int 1 if the pointer is within an arena's memory pool, 0 otherwise.
  */
 static int is_pointer_in_any_arena(const void *ptr) {
     uintptr_t addr = (uintptr_t)ptr;
@@ -1313,6 +1319,13 @@ static int is_pointer_in_any_arena(const void *ptr) {
     return 0;
 }
 
+/**
+ * @brief Returns the number of bytes actually usable in an allocated block.
+ *        (Useful for string buffers, growing vectors, etc.)
+ *
+ * @param ptr Allocated pointer (must be valid).
+ * @return size_t Usable payload size (â‰¥ requested size).
+ */
 size_t mbd_malloc_usable_size(const void *ptr) {
     if (!ptr) return 0;
 
@@ -1338,11 +1351,12 @@ size_t mbd_malloc_usable_size(const void *ptr) {
 
 
 /**
- * @brief Forces a trim of all thread caches, returning memory to the global arena.
- * @note **Heavy Operation**: This triggers a cooperative trim where every thread will
- *       completely flush its local cache on its next allocation or free. This causes a
- *       100% cache miss rate immediately following the trim. Use only for low memory
- *       emergencies, not for periodic lightweight usage.
+ * @brief Flushes all blocks from a thread's local cache back into the global arenas.
+ *
+ * This internal helper is called when a thread cache needs to be forcibly trimmed,
+ * returning all cached blocks to their respective arenas and attempting to coalesce them.
+ *
+ * @param curr Pointer to the thread cache data to flush.
  */
 static void flush_my_cache(thread_cache_data_t *curr) {
     mbd_arena_t *locked_arena = NULL;
@@ -1375,6 +1389,13 @@ static void flush_my_cache(thread_cache_data_t *curr) {
     if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
 }
 
+/**
+ * @brief Forces a trim of all thread caches, returning memory to the global arena.
+ * @note **Heavy Operation**: This triggers a cooperative trim where every thread will
+ *       completely flush its local cache on its next allocation or free. This causes a
+ *       100% cache miss rate immediately following the trim. Use only for low memory
+ *       emergencies, not for periodic lightweight usage.
+ */
 void mbd_trim(void) {
     atomic_fetch_add(&trim_requested, 1);
 }
