@@ -36,21 +36,28 @@ flowchart TD
     A[Start Application] --> B(mbd_init - Optional)
     B --> C{First Allocation?}
     C -- Yes --> D[Auto-Initialize Arenas]
-    C -- No --> E
-    D --> E[Thread Local Cache Request]
-    E --> F{Cache Hit?}
+    C -- No --> E[Allocation Request]
+    D --> E
+    E --> V{> 128 MiB?}
+    V -- Yes --> W[Bypass Pool / Direct mmap]
+    V -- No --> X[Thread Local Cache Request]
+    X --> F{Cache Hit?}
     F -- Yes --> G[Return Cached Block Fast Path]
     F -- No --> H[Lock Arena & Refill Cache / Split Buddy Block]
     H --> I[Return Aligned Block]
+    W --> J
     I --> J[Usage: mbd_realloc, mbd_malloc_usable_size, etc.]
     G --> J
     J --> K[mbd_free]
-    K --> L{Cache Full?}
+    K --> Y{Foreign Arena?}
+    Y -- Yes --> Z[Push to remote_free_queue lock-free]
+    Y -- No --> L{Cache Full?}
     L -- Yes --> M[Bulk Flush to Arena & Coalesce]
     L -- No --> N[Return to Thread Local Cache]
     M --> O
-    N --> O[Thread Exits / Cache Destroyed]
-    O --> P[Return all blocks to Global Arena]
+    N --> O[POSIX Thread Destructor triggered on Exit]
+    Z --> O
+    O --> P[Safely Return all blocks to Global Arena]
     P --> Q[Process Teardown / mbd_destroy]
 ```
 
