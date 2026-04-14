@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.1
+ * @version 1.4.2
  * @date April 13, 2026
  * @author Jacques Morel
  *
@@ -26,7 +26,7 @@
  *
  * @section usage Usage Scenarios
  * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX = 13`.
- * - **Large objects** (8 KiB â€“ 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
+ * - **Large objects** (8 KiB - 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
  * - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
  *
  * @section init Initialization & Teardown
@@ -70,13 +70,13 @@
 extern "C" {
 #endif
 
-/* â”€â”€ Configuration Macros â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* -- Configuration Macros ---------------------------------------------------- */
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
-#define MIN_ORDER          5              // 32 bytes minimum block size
+#define MIN_ORDER          6              // 64 bytes minimum block size
 #define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 
-/* â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* -- Public API -------------------------------------------------------------- */
 
 /**
  * @brief Explicitly initializes the allocator (Optional).
@@ -228,7 +228,7 @@ void mbd_dump(void);
 #endif
 
 /* ================================================================== *
- *  IMPLEMENTATION â€” define MYBUDDY_IMPLEMENTATION in exactly ONE .c  *
+ *  IMPLEMENTATION -- define MYBUDDY_IMPLEMENTATION in exactly ONE .c  *
  * ================================================================== */
 #ifdef MYBUDDY_IMPLEMENTATION
 
@@ -263,7 +263,7 @@ void mbd_dump(void);
 #endif
 #endif
 
-/* â”€â”€ Internal types (not needed by callers) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* -- Internal types (not needed by callers) -------------------------------- */
 //#define CACHELINE_ALIGN    __attribute__((aligned(64)))
 
 struct mbd_arena;
@@ -375,7 +375,7 @@ static void mbd_init_secret_key(void) {
 
 
 static inline uint32_t load_magic(const block_header_t *b) {
-    return atomic_load_explicit((_Atomic(uint32_t)*)&b->magic, memory_order_acquire);
+    return atomic_load_explicit(&b->magic, memory_order_acquire);
 }
 
 /* ================================================================== *
@@ -904,7 +904,7 @@ void *mbd_alloc(size_t requested_size) {
 
     uint32_t order = next_power_of_two_order(needed);
 
-    /* HOT PATH â€” lock-free */
+    /* HOT PATH -- lock-free */
 
 
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
@@ -986,7 +986,9 @@ void *mbd_alloc(size_t requested_size) {
                     atomic_store(&data->arena, data->native_arena);
                 }
 
-                return (void *)((uint8_t*)block + HEADER_SIZE);
+                void *res = (void *)((uint8_t*)block + HEADER_SIZE);
+                MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
+                return res;
             }
             pthread_mutex_unlock(&other_arena->lock);
         }
@@ -1289,7 +1291,7 @@ void *mbd_memalign(size_t alignment, size_t size) {
     /* Plant fake header pointing to the real allocated block for easy free-ing */
     block_header_t *fake = (block_header_t *)(aligned_addr - HEADER_SIZE);
     fake->magic = encode_magic(fake, MAGIC_MEMALIGN);
-    fake->prev = (block_header_t *)raw; 
+    fake->prev = (block_header_t *)raw;
 
     return (void *)aligned_addr;
 }
@@ -1330,7 +1332,7 @@ size_t mbd_malloc_usable_size(const void *ptr) {
         return old_usable > offset ? old_usable - offset : 0;
     }
 
-    if (block->magic != encode_magic(block, MAGIC_ALLOC)) return 0;
+    if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) return 0;
     return ((size_t)1 << block->order) - HEADER_SIZE;
 }
 
