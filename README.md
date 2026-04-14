@@ -8,17 +8,18 @@ MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high
 
 ## Key Features
 
-- **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles.
-- **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks.
-- **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation, and defused memalign exploits.
-- **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` to prevent memory hoarding.
-- **Advanced Alignment**: Mathematically guaranteed 64-byte minimum alignment (AVX-512 native), plus `mbd_memalign()` for stricter requirements.
-- **Huge Allocations**: Requests over 128 MiB seamlessly bypass the buddy pool and use tracked direct `mmap()`/`munmap()`.
-- **Production Readiness**: LD_PRELOAD-safe, self-initializing, includes atomic stats tracking (`mbd_get_stats`), and custom OOM handler hooks.
+- **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles. Dynamic per-order cache sizing limits ensure optimal memory utilization.
+- **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks. ThreadSanitizer (TSAN) clean, utilizing safe `_Atomic` lock-free checks across the header to eliminate concurrent coalescing race conditions.
+- **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation using a global randomized XOR entropy key to mitigate heap corruption, and defused memalign exploits.
+- **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` (`MADV_DONTNEED`) to prevent memory hoarding, while selectively applying `MADV_HUGEPAGE` and `MADV_DONTDUMP` to long-lived arena mappings. Includes in-place coalescing in `mbd_realloc` to avoid unnecessary copies.
+- **Advanced Alignment**: Mathematically guaranteed 32-byte minimum alignment natively, plus `mbd_memalign()` for stricter requirements like AVX-512.
+- **Huge Allocations**: Requests over 128 MiB seamlessly bypass the buddy pool and use tracked direct `mmap()`/`munmap()`, skipping redundant `memset` zeroing in `mbd_calloc` for directly-mapped blocks.
+- **Zero Thread-Exit Leaks**: Completely reclaims dead thread caches safely using POSIX thread destructors instead of racy liveness heuristics.
+- **Production Readiness**: LD_PRELOAD-safe, self-initializing, includes atomic stats tracking (`mbd_get_stats`) heavily optimized against false sharing by using 64-byte aligned per-arena structures, and custom OOM handler hooks.
 
 ## Multithreading & Concurrency
 
-- **No False Sharing**: Thread cache data structures are explicitly padded to 64-byte cachelines.
+- **No False Sharing**: Thread cache data structures and heavily contended global statistics are explicitly padded and localized to 64-byte cachelines.
 - **Anti-Hoarding & Thrashing Guard**: Full caches bulk-flush 50% of blocks. Mutex locks are batched during flushes to drastically reduce context switching.
 - **Starvation Immunity**: If a thread's native arena runs dry, it automatically migrates and binds to an arena with available memory.
 
@@ -90,30 +91,11 @@ int main() {
 ```
 
 ### Cross-thread Stress testing
-If you want to run extensive tests with multithreaded extreme load cases, the test suite includes `test_extreme_stress` and `test_cross_thread_stress` covering TSAN / ASAN validation on 16 threads cross-freeing millions of blocks dynamically.
+If you want to run extensive tests with multithreaded extreme load cases, the test suite includes `test_multithread_stress.c` covering TSAN / ASAN validation on 16 threads cross-freeing millions of blocks dynamically.
 
 Use `make test` inside the project to automatically run the suite!
 
 *Note: The allocator is self-initializing. The first call to `mbd_alloc()` or `mbd_free()` will automatically initialize the pool. For latency-sensitive applications, you may still call `mbd_init()` explicitly during startup.*
-
-## Recent Changes (1.4.0)
-- Safely synchronized concurrent block checks without taking locks by selectively introducing explicit `_Atomic` visibility across `block_header_t`.
-- Removed all ThreadSanitizer (TSAN) race reports related to `coalesce_up_and_update` crossing paths with dead thread cache `remote_free_queue` flushes.
-- Included `test_extreme_stress.c` and `test_cross_thread_stress.c` for deep concurrent validation.
-
-## Recent Changes (1.3.3)
-- Fixed false sharing by migrating heavily contended global statistic atomic variables to 64-byte aligned per-arena structs.
-- Removed racy liveness heuristics from `mbd_trim`, instead relying strictly on safe POSIX thread destructors to reclaim dead thread caches.
-- Replaced a single flat `THREAD_CACHE_SIZE` metric with dynamic per-order cache sizing limits (`get_cache_limit`).
-- Selectively applied `MADV_HUGEPAGE` and `MADV_DONTDUMP` across large long-lived mappings.
-- Cleaned up string view functions and isolated them from the main header into `mbd_strings.h`.
-- Fixed initialization memory leak in `get_thread_cache` and removed redundant memory zeroing in `mbd_calloc` for implicitly-zeroed direct mmap requests.
-- Prevented zero-usable-space payloads by pushing `MIN_ORDER` to 7 (128 bytes).
-
-## Recent Changes (1.3.2)
-- Padded headers to 64 bytes to naturally support AVX-512 alignment without requiring `mbd_memalign`.
-- Added in-place coalescing in `mbd_realloc` to efficiently expand buffers without copying data if the adjacent buddy block is free.
-- Hardened block headers by check-summing magic values with a global, randomized entropy key using XOR to mitigate heap corruption.
 
 ## API Reference
 
