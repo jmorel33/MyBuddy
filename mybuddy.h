@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.2
+ * @version 1.4.3
  * @date April 13, 2026
  * @author Jacques Morel
  *
@@ -15,7 +15,7 @@
  * - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks.
  * - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation, and defused memalign exploits.
  * - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` to prevent memory hoarding.
- * - **Advanced Alignment**: Mathematically guaranteed 64-byte minimum alignment (AVX-512 native), plus `mbd_memalign()` for stricter requirements.
+ * - **Advanced Alignment**: Mathematically guaranteed 32-byte minimum alignment, plus `mbd_memalign()` for stricter requirements.
  * - **Huge Allocations**: Requests over 128 MiB seamlessly bypass the buddy pool and use tracked direct `mmap()`/`munmap()`.
  * - **Production Readiness**: LD_PRELOAD-safe, self-initializing, includes atomic stats tracking (`mbd_get_stats`), and custom OOM handler hooks.
  *
@@ -120,8 +120,8 @@ void  mbd_free(void *ptr);
 
 /**
  * @brief Reallocates a memory block to a new size.
- *        - If ptr is NULL â†’ behaves like mbd_alloc()
- *        - If new_size is 0 â†’ frees the block and returns NULL
+ *        - If ptr is NULL -> behaves like mbd_alloc()
+ *        - If new_size is 0 -> frees the block and returns NULL
  *        - If the new size fits inside the existing block, returns the
  *          same pointer (no copy, no lock).
  *        - Otherwise allocates a fresh block, copies data, and frees the old one.
@@ -206,6 +206,9 @@ void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t));
  *       completely flush its local cache on its next allocation or free. This causes a
  *       100% cache miss rate immediately following the trim. Use only for low memory
  *       emergencies, not for periodic lightweight usage.
+ * @warning **Not async-signal-safe**: Do NOT call from signal handlers. The trim flag
+ *          is atomic, but the flush operation acquires mutexes and may deadlock if
+ *          a signal interrupts a lock.
  */
 void mbd_trim(void);
 
@@ -257,12 +260,6 @@ void mbd_dump(void);
 #endif
 #endif
 
-#if defined(__linux__) || defined(__APPLE__)
-#ifndef MADV_DONTNEED
-#define MADV_DONTNEED 4
-#endif
-#endif
-
 /* -- Internal types (not needed by callers) -------------------------------- */
 //#define CACHELINE_ALIGN    __attribute__((aligned(64)))
 
@@ -281,6 +278,10 @@ typedef struct block_header {
         size_t mmap_size;           // Used when is_mmap == 1
     };
 } block_header_t __attribute__((aligned(32)));
+
+// Prevent accidental header bloat
+static_assert(sizeof(block_header_t) == 32,
+              "block_header_t size changed; verify padding/alignment");
 
 typedef struct mbd_arena {
     pthread_mutex_t lock;
@@ -309,12 +310,12 @@ typedef struct thread_cache_data {
     uint32_t        count[SMALL_ORDER_MAX + 1];
     _Atomic(mbd_arena_t *) arena;
     mbd_arena_t *native_arena;
-    uint64_t        cache_hits;
-    uint64_t        cache_misses;
-    uint64_t        bulk_flushes;
+    _Atomic(uint64_t) cache_hits;
+    _Atomic(uint64_t) cache_misses;
+    _Atomic(uint64_t) bulk_flushes;
     int             last_trim_request;
     struct thread_cache_data *next;
-} __attribute__((aligned(64))) thread_cache_data_t;
+} thread_cache_data_t;
 
 static mbd_arena_t *arenas = NULL;
 
@@ -358,11 +359,15 @@ static inline int arena_index(const mbd_arena_t *a) {
 }
 
 static inline uint32_t encode_magic(void *block, uint32_t magic) {
-    uint32_t addr_hash = (uint32_t)((uintptr_t)block & 0xFFFFFFFF);
-#if UINTPTR_MAX == 0xFFFFFFFFFFFFFFFFULL
-    addr_hash ^= (uint32_t)((uintptr_t)block >> 32);
-#endif
-    return magic ^ addr_hash ^ mbd_secret_key;
+    // Improved address hash with better diffusion (xxhash32-inspired)
+    uintptr_t addr = (uintptr_t)block;
+    uint32_t h = (uint32_t)(addr ^ (addr >> 32));
+    h ^= h >> 16;
+    h *= 0x85ebca6b;
+    h ^= h >> 13;
+    h *= 0xc2b2ae35;
+    h ^= h >> 16;
+    return magic ^ h ^ mbd_secret_key;
 }
 
 static void mbd_init_secret_key(void) {
@@ -549,7 +554,7 @@ static void thread_cache_destructor(void *arg) {
             
             mbd_arena_t *block_arena = block->arena;
 
-            block->used = 0;
+
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
 
             atomic_fetch_sub(&block_arena->cached_bytes, 1ULL << o);
@@ -567,8 +572,7 @@ static void thread_cache_destructor(void *arg) {
 
     /* Return the cache struct itself via the remote free queue */
     block_header_t *cache_block = (block_header_t *)((uint8_t*)data - HEADER_SIZE);
-    cache_block->used = 0;
-    cache_block->magic = encode_magic(cache_block, MAGIC_FREE);
+    atomic_store_explicit(&cache_block->magic, encode_magic(cache_block, MAGIC_FREE), memory_order_release);
     mbd_arena_t *cache_arena = cache_block->arena;
 
     if (atomic_load(&cache_arena->active)) {
@@ -721,7 +725,7 @@ static thread_cache_data_t *get_thread_cache(void) {
         if (pthread_setspecific(thread_cache_key, data) != 0) {
             pthread_mutex_lock(&target_arena->lock);
             drain_remote_queue(target_arena);
-            block->used = 0;
+
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
 
             uint32_t o = block->order;
@@ -775,6 +779,7 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
         block->arena = locked_arena;
         block->next = data->cache[order];
         data->cache[order] = block;
+        atomic_signal_fence(memory_order_release);
         data->count[order]++;
         atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << order);
     }
@@ -828,6 +833,8 @@ void mbd_destroy(void) {
     arenas = NULL;
     arena_count = 1;
     atomic_store(&thread_counter, 0);
+    atomic_store(&huge_mmap_tracked, 0);
+    atomic_store(&trim_requested, 0);
     atomic_store(&active_threads, 0);
     global_cache_list = NULL;
 
@@ -909,6 +916,7 @@ void *mbd_alloc(size_t requested_size) {
 
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
         block_header_t *block = data->cache[order];
+        atomic_signal_fence(memory_order_acquire);
         data->cache[order] = block->next;
         data->count[order]--;
         atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
@@ -916,7 +924,7 @@ void *mbd_alloc(size_t requested_size) {
         block->used  = 1;
         block->is_mmap = 0;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-        data->cache_hits++;
+        atomic_fetch_add_explicit(&data->cache_hits, 1, memory_order_relaxed);
         // Notice: We intentionally do NOT overwrite block->arena.
         block->next = block->prev = NULL;
         void *res = (void *)((uint8_t*)block + HEADER_SIZE);
@@ -929,7 +937,7 @@ void *mbd_alloc(size_t requested_size) {
 
     if (order <= SMALL_ORDER_MAX) {
         if (data) {
-            data->cache_misses++;
+            atomic_fetch_add_explicit(&data->cache_misses, 1, memory_order_relaxed);
         }
         refill_thread_cache(data, arena, order);
         if (data->cache[order]) {
@@ -982,7 +990,7 @@ void *mbd_alloc(size_t requested_size) {
                 atomic_store(&data->arena, other_arena); 
 
                 /* Probabilistic return to native arena to prevent long-term crowding */
-                if ((data->cache_misses & 0x3F) == 0) {          // 1 in 64 chance
+                if ((atomic_load_explicit(&data->cache_misses, memory_order_relaxed) & 0x3F) == 0) {          // 1 in 64 chance
                     atomic_store(&data->arena, data->native_arena);
                 }
 
@@ -1056,7 +1064,7 @@ void mbd_free(void *ptr) {
         abort();
     }
 
-    block->used = 0;
+
     uint32_t order = block->order;
 
     /* Large blocks bypass cache and go straight to global pool */
@@ -1109,6 +1117,7 @@ void mbd_free(void *ptr) {
 
         block->next = data->cache[order];
         data->cache[order] = block;
+        atomic_signal_fence(memory_order_release);
         data->count[order]++;
         atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
         atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
@@ -1116,7 +1125,7 @@ void mbd_free(void *ptr) {
     }
 
     /* Bulk flush with grouped lock acquisition to prevent thrashing */
-    data->bulk_flushes++;
+    atomic_fetch_add_explicit(&data->bulk_flushes, 1, memory_order_relaxed);
     MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, limit / 2);
     mbd_arena_t *locked_arena = NULL;
     int flush_count = limit / 2;
@@ -1126,11 +1135,13 @@ void mbd_free(void *ptr) {
         data->cache[order] = to_global->next;
         data->count[order]--;
 
-        to_global->used = 0;
+
         mbd_arena_t *block_arena = to_global->arena;
 
         if (locked_arena != block_arena) {
-            if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+            if (locked_arena) {
+                pthread_mutex_unlock(&locked_arena->lock);
+            }
             locked_arena = block_arena;
             pthread_mutex_lock(&locked_arena->lock);
             drain_remote_queue(locked_arena);
@@ -1154,6 +1165,7 @@ void mbd_free(void *ptr) {
     atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
     block->next = data->cache[order];
     data->cache[order] = block;
+    atomic_signal_fence(memory_order_release);
     data->count[order]++;
     atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
     atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
@@ -1161,8 +1173,8 @@ void mbd_free(void *ptr) {
 
 /**
  * @brief Reallocates a memory block to a new size.
- *        - If ptr is NULL â†’ behaves like mbd_alloc()
- *        - If new_size is 0 â†’ frees the block and returns NULL
+ *        - If ptr is NULL -> behaves like mbd_alloc()
+ *        - If new_size is 0 -> frees the block and returns NULL
  *        - If the new size fits inside the existing block, returns the
  *          same pointer (no copy, no lock).
  *        - Otherwise allocates a fresh block, copies data, and frees the old one.
@@ -1346,7 +1358,7 @@ size_t mbd_malloc_usable_size(const void *ptr) {
     }
 
     if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) return 0;
-    return ((size_t)1 << block->order) - HEADER_SIZE;
+    return ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
 }
 
 
@@ -1369,7 +1381,9 @@ static void flush_my_cache(thread_cache_data_t *curr) {
             mbd_arena_t *block_arena = block->arena;
 
             if (locked_arena != block_arena) {
-                if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+                if (locked_arena) {
+                    pthread_mutex_unlock(&locked_arena->lock);
+                }
                 locked_arena = block_arena;
                 pthread_mutex_lock(&locked_arena->lock);
                 drain_remote_queue(locked_arena);
@@ -1395,6 +1409,9 @@ static void flush_my_cache(thread_cache_data_t *curr) {
  *       completely flush its local cache on its next allocation or free. This causes a
  *       100% cache miss rate immediately following the trim. Use only for low memory
  *       emergencies, not for periodic lightweight usage.
+ * @warning **Not async-signal-safe**: Do NOT call from signal handlers. The trim flag
+ *          is atomic, but the flush operation acquires mutexes and may deadlock if
+ *          a signal interrupts a lock.
  */
 void mbd_trim(void) {
     atomic_fetch_add(&trim_requested, 1);
@@ -1430,9 +1447,9 @@ mbd_stats_t mbd_get_stats(void) {
 
     pthread_mutex_lock(&cache_list_lock);
     for (thread_cache_data_t *curr = global_cache_list; curr; curr = curr->next) {
-        s.cache_hits += curr->cache_hits;
-        s.cache_misses += curr->cache_misses;
-        s.bulk_flushes += curr->bulk_flushes;
+        s.cache_hits += atomic_load_explicit(&curr->cache_hits, memory_order_relaxed);
+        s.cache_misses += atomic_load_explicit(&curr->cache_misses, memory_order_relaxed);
+        s.bulk_flushes += atomic_load_explicit(&curr->bulk_flushes, memory_order_relaxed);
     }
     pthread_mutex_unlock(&cache_list_lock);
     return s;
