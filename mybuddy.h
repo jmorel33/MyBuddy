@@ -26,7 +26,7 @@
  *
  * @section usage Usage Scenarios
  * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX = 13`.
- * - **Large objects** (8 KiB â€“ 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
+ * - **Large objects** (8 KiB - 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
  * - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
  *
  * @section init Initialization & Teardown
@@ -70,13 +70,13 @@
 extern "C" {
 #endif
 
-/* â”€â”€ Configuration Macros â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* -- Configuration Macros ---------------------------------------------------- */
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
 #define MIN_ORDER          6              // 64 bytes minimum block size
 #define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 
-/* â”€â”€ Public API â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* -- Public API -------------------------------------------------------------- */
 
 /**
  * @brief Explicitly initializes the allocator (Optional).
@@ -228,7 +228,7 @@ void mbd_dump(void);
 #endif
 
 /* ================================================================== *
- *  IMPLEMENTATION â€” define MYBUDDY_IMPLEMENTATION in exactly ONE .c  *
+ *  IMPLEMENTATION -- define MYBUDDY_IMPLEMENTATION in exactly ONE .c  *
  * ================================================================== */
 #ifdef MYBUDDY_IMPLEMENTATION
 
@@ -263,7 +263,7 @@ void mbd_dump(void);
 #endif
 #endif
 
-/* â”€â”€ Internal types (not needed by callers) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€ */
+/* -- Internal types (not needed by callers) -------------------------------- */
 //#define CACHELINE_ALIGN    __attribute__((aligned(64)))
 
 struct mbd_arena;
@@ -904,7 +904,7 @@ void *mbd_alloc(size_t requested_size) {
 
     uint32_t order = next_power_of_two_order(needed);
 
-    /* HOT PATH â€” lock-free */
+    /* HOT PATH -- lock-free */
 
 
     if (order <= SMALL_ORDER_MAX && data->cache[order]) {
