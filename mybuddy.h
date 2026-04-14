@@ -1303,6 +1303,12 @@ void *mbd_memalign(size_t alignment, size_t size) {
     return (void *)aligned_addr;
 }
 
+/**
+ * @brief Checks if a given pointer falls within the memory range of any active arena.
+ *
+ * @param ptr The pointer to verify.
+ * @return int 1 if the pointer is within an arena's memory pool, 0 otherwise.
+ */
 static int is_pointer_in_any_arena(const void *ptr) {
     uintptr_t addr = (uintptr_t)ptr;
     for (int a = 0; a < arena_count; a++) {
@@ -1344,6 +1350,14 @@ size_t mbd_malloc_usable_size(const void *ptr) {
 }
 
 
+/**
+ * @brief Flushes all blocks from a thread's local cache back into the global arenas.
+ *
+ * This internal helper is called when a thread cache needs to be forcibly trimmed,
+ * returning all cached blocks to their respective arenas and attempting to coalesce them.
+ *
+ * @param curr Pointer to the thread cache data to flush.
+ */
 static void flush_my_cache(thread_cache_data_t *curr) {
     mbd_arena_t *locked_arena = NULL;
     for (int o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {

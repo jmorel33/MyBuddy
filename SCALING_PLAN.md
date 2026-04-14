@@ -118,7 +118,7 @@ To successfully implement these architectural shifts without destabilizing the c
     - [x] Create an optional event hook system with the `mbd_event_type_t` enum (ALLOC, FREE, SPLIT, COALESCE, FLUSH).
     - [x] Wrap event hooks in zero-overhead `__builtin_expect` statements.
 - [x] **Phase 4 (Memory Behavior): 100% Complete**
-    - [ ] Build out fragmentation metrics by tracking per-order histograms.
+    - [x] Build out fragmentation metrics by tracking per-order histograms.
     - [x] Implement `mbd_trim()` to forcefully flush unused cache capacity from long-lived threads.
     - [x] Constrain OS page release logic (`madvise` with `MADV_DONTNEED`) strictly to `order >= PAGE_ORDER + 1` to prevent constant page churn.
 - [ ] **Phase 5 (Advanced Scaling): 0% Complete**
