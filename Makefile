@@ -1,9 +1,12 @@
 CC = gcc
 CFLAGS = -Wall -Wextra -O2 -pthread
 
-TESTS = tests/test_basic tests/test_threads tests/test_huge tests/test_string_view tests/test_usable_size tests/test_multithread_stress tests/test_brutal
+TESTS = tests/test_basic tests/test_threads tests/test_huge tests/test_string_view tests/test_usable_size tests/test_multithread_stress tests/test_brutal tests/benchmark
 
 all: $(TESTS)
+
+tests/benchmark: tests/benchmark.c mybuddy.h
+	$(CC) $(CFLAGS) $< -o $@
 
 tests/test_basic: tests/test_basic.c mybuddy.h
 	$(CC) $(CFLAGS) $< -o $@
@@ -25,6 +28,9 @@ tests/test_multithread_stress: tests/test_multithread_stress.c mybuddy.h
 
 tests/test_brutal: tests/test_brutal.c mybuddy.h
 	$(CC) $(CFLAGS) $< -o $@
+
+bench: tests/benchmark
+	@./tests/benchmark
 
 test: $(TESTS)
 	@echo "Running basic tests..."

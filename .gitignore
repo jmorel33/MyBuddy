@@ -6,3 +6,4 @@ tests/test_threads
 tests/test_huge
 tests/test_string_view
 tests/test_usable_size
+tests/benchmark
