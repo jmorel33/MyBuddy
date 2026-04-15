@@ -358,6 +358,13 @@ static inline int arena_index(const mbd_arena_t *a) {
     return (int)(a - arenas);
 }
 
+/**
+ * @brief Encodes the magic value using the global secret key and the block's address.
+ *
+ * @param block The block header.
+ * @param magic The base magic value.
+ * @return uint32_t The encoded magic value.
+ */
 static inline uint32_t encode_magic(void *block, uint32_t magic) {
     // Improved address hash with better diffusion (xxhash32-inspired)
     uintptr_t addr = (uintptr_t)block;
@@ -379,6 +386,12 @@ static void mbd_init_secret_key(void) {
 }
 
 
+/**
+ * @brief Loads the magic value from a block header safely using relaxed atomic operations.
+ *
+ * @param b The block header.
+ * @return uint32_t The raw, loaded magic value.
+ */
 static inline uint32_t load_magic(const block_header_t *b) {
     return atomic_load_explicit(&b->magic, memory_order_acquire);
 }
@@ -430,6 +443,14 @@ static inline uint32_t next_power_of_two_order(size_t req) {
 #endif
 }
 
+/**
+ * @brief Returns the buddy block of a given block within an arena.
+ *
+ * @param arena The arena containing the block.
+ * @param block The block to find the buddy for.
+ * @param order The current order (size class) of the block.
+ * @return block_header_t* Pointer to the buddy block.
+ */
 static inline block_header_t *get_buddy(mbd_arena_t *arena, block_header_t *block, uint32_t order) {
     uintptr_t offset = (uintptr_t)block - (uintptr_t)arena->memory_pool;
     if (offset & ((1ULL << order) - 1)) return NULL;
@@ -513,6 +534,10 @@ static void drain_remote_queue(mbd_arena_t *arena) {
 }
 
 
+/**
+ * @brief Handles Out-Of-Memory (OOM) conditions.
+ * Calls the user-registered OOM hook if present.
+ */
 static void handle_oom(void) {
     void (*hook)(void) = atomic_load(&global_oom_handler);
     if (hook) hook();

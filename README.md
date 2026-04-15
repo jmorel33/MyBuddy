@@ -2,14 +2,14 @@
   <img src="MyBuddy.jpg" alt="K-Term Logo" width="1024">
 </div>
 
-**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.2)
+**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.3)
 
 MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high-performance C/C++ applications. It combines the anti-fragmentation guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching. It is designed with 32-byte SIMD-safe alignment, zero thread-exit leaks, hardened safety, and is LD_PRELOAD-ready.
 
 ## Key Features
 
 - **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles. Dynamic per-order cache sizing limits ensure optimal memory utilization.
-- **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks. ThreadSanitizer (TSAN) clean, utilizing safe `_Atomic` lock-free checks across the header to eliminate concurrent coalescing race conditions.
+- **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks. ThreadSanitizer (TSAN) clean, utilizing safe `_Atomic` lock-free checks across the header to eliminate concurrent coalescing race conditions. Includes a robust mutex-protected remote free queue for cross-arena allocations.
 - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation using a global randomized XOR entropy key to mitigate heap corruption, and defused memalign exploits.
 - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` (`MADV_DONTNEED`) to prevent memory hoarding, while selectively applying `MADV_HUGEPAGE` and `MADV_DONTDUMP` to long-lived arena mappings. Includes in-place coalescing in `mbd_realloc` to avoid unnecessary copies.
 - **Advanced Alignment**: Mathematically guaranteed 32-byte minimum alignment natively, plus `mbd_memalign()` for stricter requirements like AVX-512.
@@ -50,7 +50,7 @@ flowchart TD
     G --> J
     J --> K[mbd_free]
     K --> Y{Foreign Arena?}
-    Y -- Yes --> Z[Push to remote_free_queue lock-free]
+    Y -- Yes --> Z[Lock Target Arena remote_lock & Push to remote_free_queue]
     Y -- No --> L{Cache Full?}
     L -- Yes --> M[Bulk Flush to Arena & Coalesce]
     L -- No --> N[Return to Thread Local Cache]
