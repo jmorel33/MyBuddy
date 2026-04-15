@@ -27,7 +27,7 @@ void *thread_func(void *arg) {
 }
 
 int main() {
-    mbd_init();
+    mbd_init(NULL);
 
     pthread_t threads[NUM_THREADS];
 

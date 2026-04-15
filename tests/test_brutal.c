@@ -93,7 +93,7 @@ void *churn_worker(void *arg) {
 }
 
 int main() {
-    mbd_init();
+    mbd_init(NULL);
     srand(time(NULL));
 
     memset(shared_pool, 0, sizeof(shared_pool));

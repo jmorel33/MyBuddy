@@ -4,7 +4,7 @@
 #include <assert.h>
 
 int main() {
-    mbd_init();
+    mbd_init(NULL);
 
     void *ptr = mbd_alloc(10);
     size_t usable = mbd_malloc_usable_size(ptr);

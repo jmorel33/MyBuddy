@@ -6,7 +6,7 @@
 #include <string.h>
 
 int main() {
-    mbd_init();
+    mbd_init(NULL);
 
     const char *test_str = "hello world";
     mbd_string_view_t sv1 = mbd_string_view_from_cstr(test_str);

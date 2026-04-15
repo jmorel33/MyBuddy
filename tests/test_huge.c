@@ -5,7 +5,7 @@
 #include <string.h>
 
 int main() {
-    mbd_init();
+    mbd_init(NULL);
 
     // Huge allocation (bypass buddy pool)
     size_t huge_size = 1024 * 1024 * 128 + 1024; // > 128 MiB

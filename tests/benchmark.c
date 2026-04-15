@@ -193,7 +193,7 @@ int main() {
     printf("Max Mix Size: %d\n", MAX_MIX_SIZE);
     printf("=========================================\n");
 
-    mbd_init();
+    mbd_init(NULL);
 
     double glibc_time, mbd_time;
 
