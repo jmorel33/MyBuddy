@@ -3,7 +3,7 @@
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
  * @version 1.4.3
- * @date April 13, 2026
+ * @date April 14, 2026
  * @author Jacques Morel
  *
  * @section overview Overview
