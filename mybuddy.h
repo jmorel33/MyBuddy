@@ -65,10 +65,20 @@
 
 #include <stddef.h> 
 #include <stdint.h>
+#include <stdbool.h>
 
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+typedef struct mbd_buddy_flags {
+    bool MBD_NoHashing;
+    bool MBD_NoSharedAtomics;
+    bool MBD_NoSplitting;
+    bool MBD_NoLocksonReallocShrinks;
+} mbd_buddy_flags_t;
+
+extern mbd_buddy_flags_t buddy_flags;
 
 /* -- Configuration Macros ---------------------------------------------------- */
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
@@ -235,6 +245,8 @@ void mbd_dump(void);
  * ================================================================== */
 #ifdef MYBUDDY_IMPLEMENTATION
 
+mbd_buddy_flags_t buddy_flags = {0};
+
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -366,6 +378,9 @@ static inline int arena_index(const mbd_arena_t *a) {
  * @return uint32_t The encoded magic value.
  */
 static inline uint32_t encode_magic(void *block, uint32_t magic) {
+#ifndef MBD_HARDENED_MODE
+    if (buddy_flags.MBD_NoHashing) return magic;
+#endif
     // Improved address hash with better diffusion (xxhash32-inspired)
     uintptr_t addr = (uintptr_t)block;
     uint32_t h = (uint32_t)(addr ^ (addr >> 32));
@@ -904,7 +919,7 @@ void *mbd_alloc(size_t requested_size) {
     size_t needed = requested_size + HEADER_SIZE;
 
     /* Fallback to direct mmap for gigantic allocations (> 128 MB) */
-    if (needed > POOL_SIZE) {
+    if (needed > POOL_SIZE || (buddy_flags.MBD_NoSplitting && needed > (1ULL << SMALL_ORDER_MAX))) {
         block_header_t *block = (block_header_t *)mmap(NULL, needed, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         if (block == MAP_FAILED) {
             handle_oom();
@@ -942,8 +957,10 @@ void *mbd_alloc(size_t requested_size) {
         block_header_t *block = data->cache[order];
         data->cache[order] = block->next;
         data->count[order]--;
-        atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-        atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+        if (!buddy_flags.MBD_NoSharedAtomics) {
+            atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
+            atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+        }
         block->used  = 1;
         block->is_mmap = 0;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
@@ -968,8 +985,10 @@ void *mbd_alloc(size_t requested_size) {
             block_header_t *block = data->cache[order];
             data->cache[order] = block->next;
             data->count[order]--;
-            atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-            atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+            if (!buddy_flags.MBD_NoSharedAtomics) {
+                atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
+                atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+            }
             block->used  = 1;
             block->is_mmap = 0;
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
@@ -1141,8 +1160,10 @@ void mbd_free(void *ptr) {
         block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
-        atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-        atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+        if (!buddy_flags.MBD_NoSharedAtomics) {
+            atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+            atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+        }
         return;
     }
 
@@ -1188,8 +1209,10 @@ void mbd_free(void *ptr) {
     block->next = data->cache[order];
     data->cache[order] = block;
     data->count[order]++;
-    atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-    atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+    if (!buddy_flags.MBD_NoSharedAtomics) {
+        atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+        atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+    }
 }
 
 /**
@@ -1240,7 +1263,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
     if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) abort();
 
     size_t old_usable = ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
-    if (new_size <= old_usable) return ptr;
+    if (buddy_flags.MBD_NoLocksonReallocShrinks && new_size <= old_usable) return ptr;
 
     /* Try in-place coalescing first */
     mbd_arena_t *arena = block->arena;
