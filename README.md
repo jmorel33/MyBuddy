@@ -8,7 +8,7 @@ MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high
 
 ## Key Features
 
-- **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles. Dynamic per-order cache sizing limits ensure optimal memory utilization.
+- **Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles. Dynamic per-order cache sizing limits ensure optimal memory utilization.
 - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks. ThreadSanitizer (TSAN) clean, utilizing safe `_Atomic` lock-free checks across the header to eliminate concurrent coalescing race conditions. Includes a robust mutex-protected remote free queue for cross-arena allocations.
 - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation using a global randomized XOR entropy key to mitigate heap corruption, and defused memalign exploits.
 - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` (`MADV_DONTNEED`) to prevent memory hoarding, while selectively applying `MADV_HUGEPAGE` and `MADV_DONTDUMP` to long-lived arena mappings. Includes in-place coalescing in `mbd_realloc` to avoid unnecessary copies.
