@@ -84,7 +84,7 @@ extern mbd_buddy_flags_t buddy_flags;
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
 #define MIN_ORDER          6              // 64 bytes minimum block size
-#define SMALL_ORDER_MAX    16             // Bumped to 16
+#define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 
 /* -- Public API -------------------------------------------------------------- */
 
