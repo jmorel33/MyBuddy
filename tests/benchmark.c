@@ -184,6 +184,8 @@ void mt_mix_mbd(double *time_ms) {
 }
 
 int main() {
+    buddy_flags.MBD_NoSharedAtomics = true;
+
     printf("=========================================\n");
     printf("         MyBuddy Benchmark Tool          \n");
     printf("=========================================\n");

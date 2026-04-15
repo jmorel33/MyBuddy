@@ -84,7 +84,7 @@ extern mbd_buddy_flags_t buddy_flags;
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
 #define MIN_ORDER          6              // 64 bytes minimum block size
-#define SMALL_ORDER_MAX    16             // Bumped to 16
+#define SMALL_ORDER_MAX    18   // Was 16
 
 /* -- Public API -------------------------------------------------------------- */
 
@@ -518,6 +518,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
         order++;
     }
     /* Safe madvise: Only advise the payload pages, preserving the header page */
+    /*
     if (order >= 21) {
 #if defined(__linux__) || defined(__APPLE__)
         uintptr_t block_addr = (uintptr_t)block;
@@ -529,6 +530,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
         }
 #endif
     }
+    */
     *order_out = order;
     return block;
 }
