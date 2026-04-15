@@ -71,10 +71,10 @@ extern "C" {
 #endif
 
 /* -- Configuration Macros ---------------------------------------------------- */
-#define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
+#define POOL_SIZE          (1ULL << 28)   // 256 MiB per arena
 #define MAX_ORDER          27
 #define MIN_ORDER          6              // 64 bytes minimum block size
-#define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
+#define SMALL_ORDER_MAX    18             // Includes up to 256 KiB pages
 
 /* -- Public API -------------------------------------------------------------- */
 
@@ -319,7 +319,7 @@ typedef struct thread_cache_data {
 
 static mbd_arena_t *arenas = NULL;
 
-static int arena_count = 1;
+static int arena_count = 4;
 static _Atomic uint32_t thread_counter = 0;
 static _Atomic uint32_t active_threads = 0;
 static _Atomic size_t huge_mmap_tracked = 0;
@@ -622,9 +622,9 @@ static mbd_arena_t static_arenas[MBD_MAX_ARENAS];
 static void internal_init(void) {
     long sc_page = sysconf(_SC_PAGESIZE);
     if (sc_page > 0) os_page_size = sc_page;
-    long cores = sysconf(_SC_NPROCESSORS_ONLN);
+    // // long cores = sysconf(_SC_NPROCESSORS_ONLN);
     mbd_init_secret_key();
-    arena_count = (cores > 0) ? (2 * cores) : 2;
+    arena_count = 4;
     if (arena_count > MBD_MAX_ARENAS) arena_count = MBD_MAX_ARENAS;
 
     arenas = static_arenas;
@@ -855,7 +855,7 @@ void mbd_destroy(void) {
     pthread_key_delete(thread_cache_key);
 
     arenas = NULL;
-    arena_count = 1;
+    arena_count = 4;
     atomic_store(&thread_counter, 0);
     atomic_store(&huge_mmap_tracked, 0);
     atomic_store(&trim_requested, 0);
