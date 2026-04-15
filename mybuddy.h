@@ -84,7 +84,7 @@ extern mbd_buddy_flags_t buddy_flags;
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
 #define MIN_ORDER          6              // 64 bytes minimum block size
-#define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
+#define SMALL_ORDER_MAX    16             // Bumped to 16
 
 /* -- Public API -------------------------------------------------------------- */
 
@@ -435,12 +435,10 @@ static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t ord
  * ================================================================== */
 
 static inline uint32_t get_cache_limit(uint32_t order) {
-    if (order <= 8)  return 256;   /* ≤ 256 B     → 256 objects (tiny strings, pointers, etc.) */
-    if (order <= 10) return 64;    /* ≤ 1 KiB     → 64 objects  (small structs, ECS components) */
-    if (order <= 12) return 32;    /* ≤ 4 KiB     → 32 objects  (typical pages, small arrays) */
-
-    if (order <= 15) return 16;    /* 8 KiB–32 KiB → 16 objects  (medium buffers, meshes, audio) */
-    return 4;                      /* > 32 KiB    → 4 objects   (large blocks, 64 KiB+) */
+    if (order <= 8)  return 256; /* <= 256 B: store 256 objects */
+    if (order <= 10) return 64;  /* <= 1 KiB: store 64 objects */
+    if (order <= 12) return 32;  /* <= 4 KiB: store 32 objects */
+    return 16;                   /* > 4 KiB: store 16 objects */
 }
 
 static inline uint32_t next_power_of_two_order(size_t req) {
