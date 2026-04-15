@@ -13,7 +13,7 @@ The current architecture uses a single global lock (`global_lock`) and a single 
 - [x] **Thread-to-Arena Mapping:** Don't overthink it initially. Start with a simple `arena = arenas[thread_id % arena_count];`. Explicitly define the strategy as `arena_count = 2 * number_of_cores` as a practical default (1x causes burst contention, 4x yields diminishing returns).
 - [x] **Arena-Local Caches:** The `thread_cache_data_t` TLS cache MUST be bound strictly to ONE arena with no mixing. Store the arena pointer explicitly inside the `thread_cache_data_t` struct upon initialization to prevent recomputation and drift bugs. This completely avoids reintroducing indirect cross-arena traffic.
 - [x] **Refactoring:** Update `global_insert`, `global_remove`, `coalesce_up`, and `split_block_down` to accept a pointer to the relevant `mbd_arena_t` instead of accessing global variables directly.
-- [x] **Cross-Arena Frees & Remote Queues (Crucial):** Do not rely on offset math or page headers. Add an explicit arena pointer to the header. Furthermore, to prevent cross-core lock contention during foreign frees (e.g., producer/consumer patterns), introduce a lock-free `remote_free_queue` per arena. *(Deviated: Simply locks the foreign arena directly in `mbd_free`. Verdict: Acceptable compromise for v1.2, avoids ABA-safe stack complexity).*
+- [x] **Cross-Arena Frees & Remote Queues (Crucial):** Do not rely on offset math or page headers. Add an explicit arena pointer to the header. Furthermore, to prevent cross-core lock contention during foreign frees (e.g., producer/consumer patterns), introduce a mutex-protected `remote_free_queue` per arena.
     * Make sure it's a lock-free LIFO stack (using `atomic_compare_exchange_weak`). A LIFO stack provides better cache locality, less pointer chasing, and simpler implementation. FIFO queues here are slower and unnecessary.
     * The remote queue must be drained *before* the allocation slow path when the arena locks (`pthread_mutex_lock(&arena->lock); drain_remote_queue(arena);`). Otherwise, you may unnecessarily split new blocks while free blocks are sitting in the queue. *(Skipped because queue wasn't built).*
     ```c
@@ -28,7 +28,7 @@ The current architecture uses a single global lock (`global_lock`) and a single 
     typedef struct mbd_arena {
         pthread_mutex_t lock;
         block_header_t *free_lists[MAX_ORDER + 1];
-        _Atomic(block_header_t*) remote_free_queue; // Lock-free push, lock-drain
+        struct { block_header_t *head; } remote_free_queue; // Mutex-protected push, lock-drain
         size_t committed;
         size_t reserved;
     } mbd_arena_t;
@@ -111,7 +111,7 @@ To successfully implement these architectural shifts without destabilizing the c
 - [x] **Phase 2 (Correctness + Structure): 100% Complete**
     - [x] Refactor internal helpers to be arena-aware instead of using global variables.
     - [x] Implement O(1) cross-arena frees via the `arena` header pointer.
-    - [x] Introduce a lock-free `remote_free_queue` per arena for safe, cross-core foreign frees.
+    - [x] Introduce a mutex-protected `remote_free_queue` per arena for safe, cross-core foreign frees.
 - [x] **Phase 3 (Observability): 100% Complete**
     - [x] Define `mbd_stats_t` for observability metrics (e.g., total bytes).
     - [x] Use atomic/TLS counters for tracking metrics without lock overhead.
