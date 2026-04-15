@@ -74,7 +74,7 @@ extern "C" {
 #define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
 #define MAX_ORDER          27
 #define MIN_ORDER          6              // 64 bytes minimum block size
-#define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
+#define SMALL_ORDER_MAX    16             // Includes 4 KiB pages
 
 /* -- Public API -------------------------------------------------------------- */
 
@@ -624,7 +624,7 @@ static void internal_init(void) {
     if (sc_page > 0) os_page_size = sc_page;
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
     mbd_init_secret_key();
-    arena_count = (cores > 0) ? (2 * cores) : 2;
+    arena_count = 1;
     if (arena_count > MBD_MAX_ARENAS) arena_count = MBD_MAX_ARENAS;
 
     arenas = static_arenas;
