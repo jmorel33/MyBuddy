@@ -2,9 +2,13 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.4
+ * @version 1.4.5
  * @date April 14, 2026
  * @author Jacques Morel
+ *
+ * @note v1.4.5 adds official support for GCC / MinGW-w64 on Windows.
+ *       Same API, same safety, same performance characteristics.
+ *       Uses winpthreads + native mmap emulation. No MSVC support yet.
  *
  * @section overview Overview
  * MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high-performance C/C++ applications. It combines the anti-fragmentation
@@ -245,6 +249,12 @@ void mbd_dump(void);
  * ================================================================== */
 #ifdef MYBUDDY_IMPLEMENTATION
 
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#include <windows.h>
+#include <bcrypt.h>        // BCryptGenRandom (available in MinGW-w64)
+#pragma comment(lib, "bcrypt.lib")  // only needed for MinGW linking
+#endif
+
 #include <stdio.h>
 #include <string.h>
 #include <pthread.h>
@@ -257,6 +267,22 @@ void mbd_dump(void);
 #include <stdatomic.h>
 #include <assert.h>
 #include <time.h>
+
+/* Windows / MinGW compatibility */
+#if defined(__MINGW32__) || defined(__MINGW64__)
+#ifndef MAP_NORESERVE
+#define MAP_NORESERVE 0
+#endif
+#ifndef MADV_DONTNEED
+#define MADV_DONTNEED 0
+#endif
+#ifndef MADV_HUGEPAGE
+#define MADV_HUGEPAGE 0
+#endif
+#ifndef MADV_DONTDUMP
+#define MADV_DONTDUMP 0
+#endif
+#endif
 
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -401,6 +427,9 @@ static void mbd_init_secret_key(void) {
 #if defined(__linux__)
     if (syscall(SYS_getrandom, &mbd_secret_key, sizeof(mbd_secret_key), 0) == sizeof(mbd_secret_key))
         return;
+#elif defined(__MINGW32__) || defined(__MINGW64__)
+    if (BCryptGenRandom(NULL, (PUCHAR)&mbd_secret_key, sizeof(mbd_secret_key), BCRYPT_USE_SYSTEM_PREFERRED_RNG) == STATUS_SUCCESS)
+        return;
 #endif
     mbd_secret_key = (uint32_t)(uintptr_t)&mbd_secret_key ^ (uint32_t)time(NULL) ^ 0x55AA55AA;
 }
@@ -524,7 +553,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     }
     /* Safe madvise: Only advise the payload pages, preserving the header page */
     if (order >= 21) {
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__) || defined(__APPLE__) || (defined(__MINGW32__) || defined(__MINGW64__))
         uintptr_t block_addr = (uintptr_t)block;
         uintptr_t adv_start = (block_addr + HEADER_SIZE + os_page_size - 1) & ~(os_page_size - 1);
         uintptr_t adv_end = block_addr + (1ULL << order);
@@ -680,11 +709,13 @@ static void internal_init(void) {
         
         arenas[a].memory_pool = (uint8_t *)mmap(NULL, global_config.pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (arenas[a].memory_pool == MAP_FAILED) abort();
+#if defined(__linux__) || defined(__APPLE__) || (defined(__MINGW32__) || defined(__MINGW64__))
 #if defined(MADV_HUGEPAGE)
         madvise(arenas[a].memory_pool, global_config.pool_size, MADV_HUGEPAGE);
 #endif
 #if defined(MADV_DONTDUMP)
         madvise(arenas[a].memory_pool, global_config.pool_size, MADV_DONTDUMP);
+#endif
 #endif
 
         // Find max order that fits in pool_size
@@ -967,10 +998,12 @@ void *mbd_alloc(size_t requested_size) {
             handle_oom();
             return NULL;
         }
+#if defined(__linux__) || defined(__APPLE__) || (defined(__MINGW32__) || defined(__MINGW64__))
 #if defined(MADV_HUGEPAGE)
         if (needed >= (2 * 1024 * 1024)) {
             madvise(block, needed, MADV_HUGEPAGE);
         }
+#endif
 #endif
         block->is_mmap = 1;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_MMAP), memory_order_release);
