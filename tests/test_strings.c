@@ -96,7 +96,7 @@ void test_table() {
 }
 
 int main() {
-    mbd_init();
+    mbd_init(NULL);
 
     test_string_helpers();
     test_string_builder();

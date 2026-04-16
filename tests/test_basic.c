@@ -5,7 +5,7 @@
 #include <string.h>
 
 int main() {
-    mbd_init();
+    mbd_init(NULL);
 
     // Basic allocation and free
     void *ptr1 = mbd_alloc(100);

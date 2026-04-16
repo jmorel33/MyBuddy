@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.3
+ * @version 1.4.4
  * @date April 14, 2026
  * @author Jacques Morel
  *
@@ -71,11 +71,21 @@ extern "C" {
 #endif
 
 /* -- Configuration Macros ---------------------------------------------------- */
-#define POOL_SIZE          (1ULL << 27)   // 128 MiB per arena
+/** @brief Configuration flags (can be combined with |) */
+#define MBD_FLAG_HARDENED          (1u << 0)  // 1. Randomized magic + full safety checks
+#define MBD_FLAG_ATOMIC_STATS      (1u << 1)  // 2. Update cached_bytes / cache_pressure on every alloc/free
+#define MBD_FLAG_BUDDY_LARGE       (1u << 2)  // 3. Use buddy system for blocks > SMALL_ORDER_MAX (OFF = direct mmap)
+#define MBD_FLAG_REALLOC_LOCK      (1u << 3)  // 4. Take lock even on realloc shrinks (OFF = early return)
+
+typedef struct {
+    uint32_t flags;
+    int arena_count;
+    size_t pool_size;
+} mbd_config_t;
+
 #define MAX_ORDER          27
 #define MIN_ORDER          6              // 64 bytes minimum block size
 #define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
-
 /* -- Public API -------------------------------------------------------------- */
 
 /**
@@ -88,7 +98,7 @@ extern "C" {
  *
  * This function is thread-safe and idempotent.
  */
-void  mbd_init(void);
+void  mbd_init(const mbd_config_t *config);
 
 /**
  * @brief Destroys the allocator and unmaps all arenas.
@@ -319,7 +329,17 @@ typedef struct thread_cache_data {
 
 static mbd_arena_t *arenas = NULL;
 
+static mbd_config_t global_config = {
+    .flags = 0,
+    .arena_count = 0,
+    .pool_size = (1ULL << 27) // 128 MiB default
+};
+
+static mbd_config_t pending_config = {0};
+static _Atomic int config_set = 0;
+
 static int arena_count = 1;
+
 static _Atomic uint32_t thread_counter = 0;
 static _Atomic uint32_t active_threads = 0;
 static _Atomic size_t huge_mmap_tracked = 0;
@@ -455,7 +475,7 @@ static inline block_header_t *get_buddy(mbd_arena_t *arena, block_header_t *bloc
     uintptr_t offset = (uintptr_t)block - (uintptr_t)arena->memory_pool;
     if (offset & ((1ULL << order) - 1)) return NULL;
     uintptr_t buddy_offset = offset ^ (1ULL << order);
-    if (buddy_offset >= POOL_SIZE) return NULL;
+    if (buddy_offset >= global_config.pool_size) return NULL;
     return (block_header_t *)(arena->memory_pool + buddy_offset);
 }
 
@@ -620,11 +640,29 @@ static void thread_cache_destructor(void *arg) {
 static mbd_arena_t static_arenas[MBD_MAX_ARENAS];
 
 static void internal_init(void) {
+    if (atomic_load(&config_set)) {
+        global_config = pending_config;
+    }
+    if (global_config.pool_size == 0) {
+        global_config.pool_size = (1ULL << 27);
+    } else {
+        if (global_config.pool_size > (1ULL << MAX_ORDER)) {
+            global_config.pool_size = (1ULL << MAX_ORDER);
+        }
+        // Ensure pool_size is a power of 2
+        size_t p = 1;
+        while (p < global_config.pool_size) p <<= 1;
+        global_config.pool_size = p;
+    }
     long sc_page = sysconf(_SC_PAGESIZE);
     if (sc_page > 0) os_page_size = sc_page;
     long cores = sysconf(_SC_NPROCESSORS_ONLN);
     mbd_init_secret_key();
-    arena_count = (cores > 0) ? (2 * cores) : 2;
+    if (global_config.arena_count > 0) {
+        arena_count = global_config.arena_count;
+    } else {
+        arena_count = (cores > 0) ? (2 * cores) : 2;
+    }
     if (arena_count > MBD_MAX_ARENAS) arena_count = MBD_MAX_ARENAS;
 
     arenas = static_arenas;
@@ -640,24 +678,33 @@ static void internal_init(void) {
         atomic_init(&arenas[a].active, 1);
         for (int i = 0; i <= MAX_ORDER; i++) arenas[a].free_lists[i] = NULL;
         
-        arenas[a].memory_pool = (uint8_t *)mmap(NULL, POOL_SIZE, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        arenas[a].memory_pool = (uint8_t *)mmap(NULL, global_config.pool_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
         if (arenas[a].memory_pool == MAP_FAILED) abort();
 #if defined(MADV_HUGEPAGE)
-        madvise(arenas[a].memory_pool, POOL_SIZE, MADV_HUGEPAGE);
+        madvise(arenas[a].memory_pool, global_config.pool_size, MADV_HUGEPAGE);
 #endif
 #if defined(MADV_DONTDUMP)
-        madvise(arenas[a].memory_pool, POOL_SIZE, MADV_DONTDUMP);
+        madvise(arenas[a].memory_pool, global_config.pool_size, MADV_DONTDUMP);
 #endif
 
+        // Find max order that fits in pool_size
+        uint32_t max_order = 0;
+        size_t temp_size = global_config.pool_size;
+        while (temp_size > 1) {
+            temp_size >>= 1;
+            max_order++;
+        }
+        if (max_order > MAX_ORDER) max_order = MAX_ORDER;
+
         block_header_t *initial = (block_header_t *)arenas[a].memory_pool;
-        initial->order = MAX_ORDER;
+        initial->order = max_order;
         initial->used  = 0;
         initial->is_mmap = 0;
         atomic_store_explicit(&initial->magic, encode_magic(initial, MAGIC_FREE), memory_order_release);
         initial->arena = &arenas[a];
         initial->next = initial->prev = NULL;
         
-        arenas[a].free_lists[MAX_ORDER] = initial;
+        arenas[a].free_lists[max_order] = initial;
     }
 
     pthread_key_create(&thread_cache_key, thread_cache_destructor);
@@ -823,7 +870,17 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
  *
  * This function is thread-safe and idempotent.
  */
-void mbd_init(void) {
+static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+void mbd_init(const mbd_config_t *config) {
+    if (config && !atomic_load(&config_set)) {
+        pthread_mutex_lock(&init_mutex);
+        if (!atomic_load(&config_set)) {
+            pending_config = *config;
+            atomic_store(&config_set, 1);
+        }
+        pthread_mutex_unlock(&init_mutex);
+    }
     pthread_once(&init_once, internal_init);
 }
 
@@ -846,7 +903,7 @@ void mbd_destroy(void) {
 
     for (int a = 0; a < arena_count; a++) {
         if (arenas[a].memory_pool && arenas[a].memory_pool != MAP_FAILED) {
-            munmap(arenas[a].memory_pool, POOL_SIZE);
+            munmap(arenas[a].memory_pool, global_config.pool_size);
             arenas[a].memory_pool = NULL;
         }
         pthread_mutex_destroy(&arenas[a].lock);
@@ -904,7 +961,7 @@ void *mbd_alloc(size_t requested_size) {
     size_t needed = requested_size + HEADER_SIZE;
 
     /* Fallback to direct mmap for gigantic allocations (> 128 MB) */
-    if (needed > POOL_SIZE) {
+    if (needed > global_config.pool_size) {
         block_header_t *block = (block_header_t *)mmap(NULL, needed, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
         if (block == MAP_FAILED) {
             handle_oom();
@@ -1083,7 +1140,7 @@ void mbd_free(void *ptr) {
     mbd_arena_t *arena = block->arena;
     if (!arena || arena < arenas || arena >= arenas + arena_count) abort();
     if ((uintptr_t)ptr < (uintptr_t)arena->memory_pool + HEADER_SIZE ||
-        (uintptr_t)ptr >= (uintptr_t)arena->memory_pool + POOL_SIZE) {
+        (uintptr_t)ptr >= (uintptr_t)arena->memory_pool + global_config.pool_size) {
         abort();
     }
 
@@ -1151,7 +1208,7 @@ void mbd_free(void *ptr) {
     MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, limit / 2);
     mbd_arena_t *locked_arena = NULL;
     int flush_count = limit / 2;
-    if (atomic_load(&data->arena->cache_pressure) > POOL_SIZE / 4) { flush_count = (limit * 3) / 4; }
+    if (atomic_load(&data->arena->cache_pressure) > global_config.pool_size / 4) { flush_count = (limit * 3) / 4; }
     while (flush_count-- > 0 && data->cache[order]) {
         block_header_t *to_global = data->cache[order];
         data->cache[order] = to_global->next;
@@ -1345,7 +1402,7 @@ void *mbd_memalign(size_t alignment, size_t size) {
 static int is_pointer_in_any_arena(const void *ptr) {
     uintptr_t addr = (uintptr_t)ptr;
     for (int a = 0; a < arena_count; a++) {
-        if (arenas[a].memory_pool && addr >= (uintptr_t)arenas[a].memory_pool && addr < (uintptr_t)arenas[a].memory_pool + POOL_SIZE) {
+        if (arenas[a].memory_pool && addr >= (uintptr_t)arenas[a].memory_pool && addr < (uintptr_t)arenas[a].memory_pool + global_config.pool_size) {
             return 1;
         }
     }
@@ -1446,7 +1503,7 @@ void mbd_trim(void) {
 mbd_stats_t mbd_get_stats(void) {
     pthread_once(&init_once, internal_init);
     mbd_stats_t s = {0};
-    s.total_mapped_bytes = ((size_t)arena_count * POOL_SIZE) + atomic_load(&huge_mmap_tracked);
+    s.total_mapped_bytes = ((size_t)arena_count * global_config.pool_size) + atomic_load(&huge_mmap_tracked);
     
     if (arenas) {
         for (int a = 0; a < arena_count; a++) {
