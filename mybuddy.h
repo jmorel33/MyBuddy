@@ -93,7 +93,7 @@ extern "C" {
 #define MIN_ORDER          6              // 64 bytes minimum block size
 #endif
 #ifndef SMALL_ORDER_MAX
-#define SMALL_ORDER_MAX    16             // Includes 4 KiB pages
+#define SMALL_ORDER_MAX    20             // Includes 1 MiB blocks (was 16)
 #endif
 
 typedef struct {
@@ -400,7 +400,7 @@ typedef struct mbd_arena {
     block_header_t *free_lists[MAX_ORDER + 1];
     uint8_t *memory_pool;
     struct {
-        block_header_t *head;
+        _Atomic(block_header_t *) head;
     } remote_free_queue;
     _Atomic size_t cached_bytes;
     _Atomic size_t cache_pressure;
@@ -643,10 +643,12 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     return block;
 }
 static void drain_remote_queue(mbd_arena_t *arena) {
+    if (atomic_load_explicit(&arena->remote_free_queue.head, memory_order_acquire) == NULL) return;
+
     pthread_mutex_lock(&arena->remote_lock);
-    block_header_t *head = arena->remote_free_queue.head;
-    arena->remote_free_queue.head = NULL;
+    block_header_t *head = atomic_exchange_explicit(&arena->remote_free_queue.head, (block_header_t*)NULL, memory_order_acquire);
     pthread_mutex_unlock(&arena->remote_lock);
+
     while (head) {
         block_header_t *next = head->next;
         atomic_store_explicit(&head->magic, encode_magic(head, MAGIC_FREE), memory_order_release);
@@ -744,9 +746,9 @@ static void thread_cache_destructor(void *arg) {
             if (atomic_load(&block_arena->active)) {
                 pthread_mutex_lock(&block_arena->remote_lock);
                 block->prev = NULL;
-                block->next = block_arena->remote_free_queue.head;
+                block->next = atomic_load_explicit(&block_arena->remote_free_queue.head, memory_order_relaxed);
                 atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
-                block_arena->remote_free_queue.head = block;
+                atomic_store_explicit(&block_arena->remote_free_queue.head, block, memory_order_release);
                 pthread_mutex_unlock(&block_arena->remote_lock);
             }
         }
@@ -760,9 +762,9 @@ static void thread_cache_destructor(void *arg) {
     if (atomic_load(&cache_arena->active)) {
         pthread_mutex_lock(&cache_arena->remote_lock);
         cache_block->prev = NULL;
-        cache_block->next = cache_arena->remote_free_queue.head;
+        cache_block->next = atomic_load_explicit(&cache_arena->remote_free_queue.head, memory_order_relaxed);
         atomic_store_explicit(&cache_block->magic, encode_magic(cache_block, MAGIC_FREE), memory_order_release);
-        cache_arena->remote_free_queue.head = cache_block;
+        atomic_store_explicit(&cache_arena->remote_free_queue.head, cache_block, memory_order_release);
         pthread_mutex_unlock(&cache_arena->remote_lock);
     }
 
@@ -799,7 +801,8 @@ static void internal_init(void) {
             else if (order <= 10) global_config.cache_limits[order] = 64;   /* <= 1 KiB     */
             else if (order <= 12) global_config.cache_limits[order] = 32;   /* <= 4 KiB     */
             else if (order <= 15) global_config.cache_limits[order] = 16;   /* 8-32 KiB     */
-            else                  global_config.cache_limits[order] = 4;    /* >= 64 KiB    */
+            else if (order <= 18) global_config.cache_limits[order] = 8;    /* 64-256 KiB   */
+            else                  global_config.cache_limits[order] = 4;    /* 512 KiB-1MB  */
         }
     }
     if (global_config.pool_size == 0) {
@@ -829,7 +832,7 @@ static void internal_init(void) {
     for (int a = 0; a < arena_count; a++) {
         pthread_mutex_init(&arenas[a].lock, NULL);
         pthread_mutex_init(&arenas[a].remote_lock, NULL);
-        arenas[a].remote_free_queue.head = NULL;
+        atomic_init(&arenas[a].remote_free_queue.head, NULL);
         atomic_init(&arenas[a].cached_bytes, 0);
         atomic_init(&arenas[a].cache_pressure, 0);
         atomic_init(&arenas[a].splits, 0);
@@ -1344,12 +1347,13 @@ void mbd_free(void *ptr) {
 
     /* Remote free queue push if we are on foreign thread cache */
     if (data && block->arena != atomic_load(&data->arena)) {
-        pthread_mutex_lock(&block->arena->remote_lock);
+        mbd_arena_t *block_arena = block->arena;
+        pthread_mutex_lock(&block_arena->remote_lock);
         block->prev = NULL;
-        block->next = block->arena->remote_free_queue.head;
+        block->next = atomic_load_explicit(&block_arena->remote_free_queue.head, memory_order_relaxed);
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
-        block->arena->remote_free_queue.head = block;
-        pthread_mutex_unlock(&block->arena->remote_lock);
+        atomic_store_explicit(&block_arena->remote_free_queue.head, block, memory_order_release);
+        pthread_mutex_unlock(&block_arena->remote_lock);
         return;
     }
 
