@@ -81,15 +81,16 @@ extern "C" {
 #define MBD_FLAG_BUDDY_LARGE       (1u << 2)  // 3. Use buddy system for blocks > SMALL_ORDER_MAX (OFF = direct mmap)
 #define MBD_FLAG_REALLOC_LOCK      (1u << 3)  // 4. Take lock even on realloc shrinks (OFF = early return)
 
+#define MAX_ORDER          27
+#define MIN_ORDER          6              // 64 bytes minimum block size
+#define SMALL_ORDER_MAX    16             // Includes 4 KiB pages
+
 typedef struct {
     uint32_t flags;
     int arena_count;
     size_t pool_size;
+    uint32_t cache_limits[SMALL_ORDER_MAX + 1];
 } mbd_config_t;
-
-#define MAX_ORDER          27
-#define MIN_ORDER          6              // 64 bytes minimum block size
-#define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 /* -- Public API -------------------------------------------------------------- */
 
 /**
@@ -469,10 +470,8 @@ static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t ord
  * ================================================================== */
 
 static inline uint32_t get_cache_limit(uint32_t order) {
-    if (order <= 8)  return 256; /* <= 256 B: store 256 objects */
-    if (order <= 10) return 64;  /* <= 1 KiB: store 64 objects */
-    if (order <= 12) return 32;  /* <= 4 KiB: store 32 objects */
-    return 16;                   /* > 4 KiB: store 16 objects */
+    if (order > SMALL_ORDER_MAX) return 0;
+    return global_config.cache_limits[order];
 }
 
 static inline uint32_t next_power_of_two_order(size_t req) {
@@ -671,6 +670,22 @@ static mbd_arena_t static_arenas[MBD_MAX_ARENAS];
 static void internal_init(void) {
     if (atomic_load(&config_set)) {
         global_config = pending_config;
+    }
+    int has_custom_limits = 0;
+    for (uint32_t i = 0; i <= SMALL_ORDER_MAX; i++) {
+        if (global_config.cache_limits[i] != 0) {
+            has_custom_limits = 1;
+            break;
+        }
+    }
+
+    if (!has_custom_limits) {
+        for (uint32_t order = 0; order <= SMALL_ORDER_MAX; order++) {
+            if (order <= 8)  global_config.cache_limits[order] = 256;
+            else if (order <= 10) global_config.cache_limits[order] = 64;
+            else if (order <= 12) global_config.cache_limits[order] = 32;
+            else global_config.cache_limits[order] = 16;
+        }
     }
     if (global_config.pool_size == 0) {
         global_config.pool_size = (1ULL << 27);
@@ -1223,6 +1238,7 @@ void mbd_free(void *ptr) {
 
 
 
+    if (order > SMALL_ORDER_MAX) __builtin_unreachable();
     uint32_t limit = get_cache_limit(order);
     if (data->count[order] < limit) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << block->order);
