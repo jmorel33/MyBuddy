@@ -419,6 +419,7 @@ static inline int arena_index(const mbd_arena_t *a) {
  * @return uint32_t The encoded magic value.
  */
 static inline uint32_t encode_magic(void *block, uint32_t magic) {
+    if (!(global_config.flags & MBD_FLAG_HARDENED)) return magic;
     // Improved address hash with better diffusion (xxhash32-inspired)
     uintptr_t addr = (uintptr_t)block;
     uint32_t h = (uint32_t)(addr ^ (addr >> 32));
