@@ -205,7 +205,9 @@ int main() {
     printf("Max Mix Size: %d\n", MAX_MIX_SIZE);
     printf("=========================================\n");
 
-    mbd_init(NULL);
+        mbd_config_t cfg = {0};
+    cfg.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
+    mbd_init(&cfg);
 
     double glibc_time, mbd_time;
 
