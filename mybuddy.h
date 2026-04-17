@@ -225,6 +225,26 @@ typedef enum {
 void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t));
 
 /**
+ * @brief Explicitly returns unused high-order memory to the operating system.
+ *
+ * Scans all arenas and calls madvise(MADV_DONTNEED) on the payload pages
+ * of free blocks >= 2 MiB (order >= 21). This immediately reduces the
+ * process's RSS but will cause page faults when that memory is next allocated.
+ *
+ * Unlike mbd_trim() (which flushes thread-local caches), this function
+ * operates on the global free lists and acquires each arena lock briefly.
+ *
+ * @note Call this after mbd_trim() for maximum memory return:
+ *       mbd_trim()        — flushes caches, coalesces blocks
+ *       mbd_release_to_os — returns the resulting large free blocks to the OS
+ *
+ * @warning Causes hard page faults on re-allocation of released pages.
+ *          Only use in low-memory situations where RSS reduction matters
+ *          more than allocation latency.
+ */
+void mbd_release_to_os(void);
+
+/**
  * @brief Forces a trim of all thread caches, returning memory to the global arena.
  * @note **Heavy Operation**: This triggers a cooperative trim where every thread will
  *       completely flush its local cache on its next allocation or free. This causes a
@@ -323,6 +343,24 @@ static inline long mbd_sysconf(int name) {
 #define MADV_DONTNEED MADV_FREE
 #else
 #define MADV_DONTNEED 0
+#endif
+#endif
+
+/* ── Choose release strategy ──
+ * MADV_FREE:  Lazy release — pages stay mapped and valid until the kernel
+ *             needs them elsewhere. Re-allocation is nearly free if the
+ *             OS hasn't reclaimed them. Ideal for allocators.
+ * MADV_DONTNEED: Eager release — pages are immediately discarded. Causes
+ *                hard page faults on re-access but guarantees instant RSS
+ *                reduction. Use when you need to free physical RAM *now*.
+ */
+#ifndef MBD_MADV_RELEASE
+#if defined(__linux__) && defined(MADV_FREE)
+#define MBD_MADV_RELEASE  MADV_FREE
+#elif defined(MADV_DONTNEED)
+#define MBD_MADV_RELEASE  MADV_DONTNEED
+#else
+#define MBD_MADV_RELEASE  0
 #endif
 #endif
 
@@ -593,18 +631,12 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
         block->order = order + 1;
         order++;
     }
-    /* Safe madvise: Only advise the payload pages, preserving the header page */
-    if (order >= 21) {
-#if defined(__linux__) || defined(__APPLE__) || (defined(__MINGW32__) || defined(__MINGW64__))
-        uintptr_t block_addr = (uintptr_t)block;
-        uintptr_t adv_start = (block_addr + HEADER_SIZE + os_page_size - 1) & ~(os_page_size - 1);
-        uintptr_t adv_end = block_addr + (1ULL << order);
-        
-        if (adv_end > adv_start) {
-            madvise((void *)adv_start, adv_end - adv_start, MADV_DONTNEED);
-        }
-#endif
-    }
+    /* ── REMOVED: madvise(MADV_DONTNEED) cascade ──
+     * Physical pages are no longer discarded during coalescing.
+     * This keeps the buddy pool "warm" — re-allocation hits
+     * already-backed pages instead of triggering hard faults.
+     * Use mbd_release_to_os() to explicitly return memory.
+     */
     *order_out = order;
     return block;
 }
@@ -622,6 +654,34 @@ static void drain_remote_queue(mbd_arena_t *arena) {
         arena_insert(arena, order, head);
         head = next;
     }
+}
+
+/**
+ * @brief Releases physical pages of high-order free blocks back to the OS.
+ *
+ * Scans each arena's free lists for blocks of order >= 21 (2 MiB) and
+ * advises the kernel that the payload pages are no longer needed.
+ * The header page is preserved so free-list traversal remains valid.
+ *
+ * MUST be called while holding the arena lock.
+ *
+ * @param arena The arena to scan.
+ */
+static void mbd_madvise_free_blocks(mbd_arena_t *arena) {
+#if MBD_MADV_RELEASE != 0
+    for (uint32_t order = 21; order <= MAX_ORDER; order++) {
+        for (block_header_t *block = arena->free_lists[order]; block; block = block->next) {
+            uintptr_t block_addr = (uintptr_t)block;
+            uintptr_t adv_start  = (block_addr + HEADER_SIZE + os_page_size - 1) & ~(os_page_size - 1);
+            uintptr_t adv_end    = block_addr + (1ULL << order);
+            if (adv_end > adv_start) {
+                madvise((void *)adv_start, adv_end - adv_start, MBD_MADV_RELEASE);
+            }
+        }
+    }
+#else
+    (void)arena;
+#endif
 }
 
 
@@ -1632,8 +1692,26 @@ static void flush_my_cache(thread_cache_data_t *curr) {
  *          is atomic, but the flush operation acquires mutexes and may deadlock if
  *          a signal interrupts a lock.
  */
+void mbd_release_to_os(void) {
+    pthread_once(&init_once, internal_init);
+    if (!arenas) return;
+
+    for (int a = 0; a < arena_count; a++) {
+        pthread_mutex_lock(&arenas[a].lock);
+        drain_remote_queue(&arenas[a]);
+        mbd_madvise_free_blocks(&arenas[a]);
+        pthread_mutex_unlock(&arenas[a].lock);
+    }
+}
+
 void mbd_trim(void) {
     atomic_fetch_add(&trim_requested, 1);
+    /* Also release any already-coalesced high-order blocks to the OS.
+     * Note: thread caches are flushed lazily, so newly coalesced blocks
+     * from the flush won't be released until the next mbd_release_to_os()
+     * or mbd_trim() call. Call mbd_release_to_os() again after a brief
+     * delay if maximum RSS reduction is needed. */
+    mbd_release_to_os();
 }
 
 /**
