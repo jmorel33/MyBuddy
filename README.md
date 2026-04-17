@@ -58,7 +58,9 @@ flowchart TD
     N --> O[POSIX Thread Destructor triggered on Exit]
     Z --> O
     O --> P[Safely Return all blocks to Global Arena]
-    P --> Q[Process Teardown / mbd_destroy]
+    P --> R[Manual: mbd_release_to_os / mbd_trim]
+    R --> S[Lazily Return High-Order Blocks to OS via madvise]
+    S --> Q[Process Teardown / mbd_destroy]
 ```
 
 ## Quick Start
