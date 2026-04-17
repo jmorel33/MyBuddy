@@ -262,7 +262,7 @@ void mbd_dump(void);
 #if defined(__MINGW32__) || defined(__MINGW64__)
 #include <windows.h>
 #include <bcrypt.h>        // BCryptGenRandom (available in MinGW-w64)
-#pragma comment(lib, "bcrypt.lib")  // only needed for MinGW linking
+// User must pass -lbcrypt manually during linking for MinGW
 #endif
 
 #include <stdio.h>
@@ -270,16 +270,35 @@ void mbd_dump(void);
 #include <pthread.h>
 #include <stdlib.h>
 #if defined(__MINGW32__) || defined(__MINGW64__)
-#include <windows.h>
+#ifndef _SC_PAGESIZE
+#define _SC_PAGESIZE 1
+#endif
+#ifndef _SC_NPROCESSORS_ONLN
+#define _SC_NPROCESSORS_ONLN 2
+#endif
+
+static inline long mbd_sysconf(int name) {
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    if (name == _SC_PAGESIZE) {
+        return si.dwPageSize;
+    }
+    if (name == _SC_NPROCESSORS_ONLN) {
+        return si.dwNumberOfProcessors;
+    }
+    return 0;
+}
+#define sysconf mbd_sysconf
+
 #define mmap(a,b,c,d,e,f) VirtualAlloc(a, b, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
 #define munmap(a,b) VirtualFree(a, 0, MEM_RELEASE)
-#define sysconf(x) (4096)
 #define MAP_FAILED NULL
 #define PROT_READ 0
 #define PROT_WRITE 0
 #define MAP_PRIVATE 0
 #define MAP_ANONYMOUS 0
 #define MAP_NORESERVE 0
+
 #else
 #include <unistd.h>
 #include <sys/mman.h>
@@ -992,14 +1011,6 @@ void mbd_destroy(void) {
 
     assert(atomic_load(&active_threads) == 0 && "mbd_destroy called while other threads are active!");
     
-    while (atomic_load(&active_threads) > 0) {
-#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
-        Sleep(1);
-#else
-        usleep(1000);
-#endif
-    }
-
     for (int a = 0; a < arena_count; a++) {
         atomic_store(&arenas[a].active, 0);
     }
