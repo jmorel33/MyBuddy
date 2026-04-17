@@ -2,11 +2,14 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.5
- * @date April 14, 2026
+ * @version 1.4.6
+ * @date April 16, 2026
  * @author Jacques Morel
  *
- * @note v1.4.5 adds official support for GCC / MinGW-w64 on Windows.
+ * @note v1.4.6 introduces granular thread cache limit configurations
+ *       via `mbd_config_t` and disables `MBD_FLAG_HARDENED` by default
+ *       for significant performance gains.
+ *       v1.4.5 adds official support for GCC / MinGW-w64 on Windows.
  *       Same API, same safety, same performance characteristics.
  *       Uses winpthreads + native mmap emulation. No MSVC support yet.
  *
@@ -29,7 +32,7 @@
  * - **Starvation Immunity**: If a thread's native arena runs dry, it automatically migrates and binds to an arena with available memory.
  *
  * @section usage Usage Scenarios
- * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX = 13`.
+ * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX` (defaults to 16).
  * - **Large objects** (8 KiB - 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
  * - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
  *

@@ -2,7 +2,7 @@
   <img src="MyBuddy.jpg" alt="K-Term Logo" width="1024">
 </div>
 
-**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.5)
+**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.6)
 
 MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high-performance C/C++ applications. It combines the anti-fragmentation guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching. It is designed with 32-byte SIMD-safe alignment, zero thread-exit leaks, hardened safety, and is LD_PRELOAD-ready.
 
@@ -25,7 +25,7 @@ MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high
 
 ## Usage Scenarios
 
-- **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX = 13`.
+- **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX` (defaults to 16).
 - **Large objects** (8 KiB – 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
 - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
 
@@ -107,8 +107,8 @@ Use `make test` inside the project to automatically run the suite!
 ## API Reference
 
 ### Core Memory Operations
-- `void mbd_init(void);`
-  Explicitly initializes the allocator. Optional, as the library is self-initializing.
+- `void mbd_init(const mbd_config_t *config);`
+  Explicitly initializes the allocator with an optional configuration struct (pass `NULL` for defaults). The config allows you to override total pool size, number of arenas, hardening flags (`MBD_FLAG_HARDENED`), and per-order thread cache limits.
 - `void mbd_destroy(void);`
   Destroys the allocator and unmaps all arenas. Strictly for unit-testing and clean process teardown.
 - `void *mbd_alloc(size_t requested_size);`
