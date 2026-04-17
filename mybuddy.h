@@ -305,26 +305,14 @@ static inline long mbd_sysconf(int name) {
 #endif
 #include <errno.h>
 #include <signal.h>
+#if defined(__linux__)
 #include <sys/syscall.h>
+#endif
 #include <stdatomic.h>
 #include <assert.h>
 #include <time.h>
 
-/* Windows / MinGW compatibility */
-#if defined(__MINGW32__) || defined(__MINGW64__)
-#ifndef MAP_NORESERVE
-#define MAP_NORESERVE 0
-#endif
-#ifndef MADV_DONTNEED
-#define MADV_DONTNEED 0
-#endif
-#ifndef MADV_HUGEPAGE
-#define MADV_HUGEPAGE 0
-#endif
-#ifndef MADV_DONTDUMP
-#define MADV_DONTDUMP 0
-#endif
-#endif
+
 
 #ifndef MAP_NORESERVE
 #define MAP_NORESERVE 0
@@ -570,7 +558,7 @@ static block_header_t* split_block_down(mbd_arena_t *arena, block_header_t *bloc
         buddy->order = new_order;
         buddy->used  = 0;
         buddy->is_mmap = 0;
-        buddy->magic = encode_magic(buddy, MAGIC_FREE);
+        atomic_store_explicit(&buddy->magic, encode_magic(buddy, MAGIC_FREE), memory_order_release);
 
         buddy->arena = arena;
         buddy->next = buddy->prev = NULL;
@@ -588,7 +576,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
         block_header_t *buddy = get_buddy(arena, block, order);
         if (!buddy) break;
 
-        // TSAN-safe reads
+        // Reads safe under arena lock
         if (load_magic(buddy) != encode_magic(buddy, MAGIC_FREE) ||
             buddy->order != order ||
             buddy->arena != arena)
@@ -966,7 +954,9 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
         block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
-        atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << order);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << order);
+        }
     }
 }
 
