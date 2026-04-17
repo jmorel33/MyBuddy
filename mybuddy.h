@@ -688,16 +688,18 @@ static void internal_init(void) {
             break;
         }
     }
-
+    
     // We assume limits are uninitialized only if all limits are 0.
     // If a user genuinely wants to disable the cache by setting everything to 0,
     // they can just set SMALL_ORDER_MAX to 0. Otherwise this defaults behavior.
+    /* ── Default cache limit table (performance-oriented, user-overridable) ── */
     if (limits_uninitialized) {
         for (uint32_t order = 0; order <= SMALL_ORDER_MAX; order++) {
-            if (order <= 8)  global_config.cache_limits[order] = 256;
-            else if (order <= 10) global_config.cache_limits[order] = 64;
-            else if (order <= 12) global_config.cache_limits[order] = 32;
-            else global_config.cache_limits[order] = 16;
+            if (order <= 8)       global_config.cache_limits[order] = 256;  /* <= 256 B     */
+            else if (order <= 10) global_config.cache_limits[order] = 64;   /* <= 1 KiB     */
+            else if (order <= 12) global_config.cache_limits[order] = 32;   /* <= 4 KiB     */
+            else if (order <= 15) global_config.cache_limits[order] = 16;   /* 8-32 KiB     */
+            else                  global_config.cache_limits[order] = 4;    /* >= 64 KiB    */
         }
     }
     if (global_config.pool_size == 0) {
