@@ -2,7 +2,7 @@
   <img src="MyBuddy.jpg" alt="K-Term Logo" width="1024">
 </div>
 
-**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.7)
+**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.5.0)
 
 MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high-performance C/C++ applications. It combines the anti-fragmentation guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching. It is designed with 32-byte SIMD-safe alignment, zero thread-exit leaks, hardened safety, and is LD_PRELOAD-ready.
 
@@ -11,7 +11,7 @@ MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high
 - **Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles. Dynamic per-order cache sizing limits ensure optimal memory utilization.
 - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks. ThreadSanitizer (TSAN) clean, utilizing safe `_Atomic` lock-free checks across the header to eliminate concurrent coalescing race conditions. Includes a robust mutex-protected remote free queue for cross-arena allocations.
 - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation using a global randomized XOR entropy key to mitigate heap corruption, and defused memalign exploits.
-- **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` (`MADV_DONTNEED`) to prevent memory hoarding, while selectively applying `MADV_HUGEPAGE` and `MADV_DONTDUMP` to long-lived arena mappings. Includes in-place coalescing in `mbd_realloc` to avoid unnecessary copies.
+- **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via an explicit `mbd_release_to_os()` call, which utilizes `madvise` (preferring `MADV_FREE` on Linux, falling back to `MADV_DONTNEED`) to lazily release memory while keeping the buddy pool warm to prevent hard page fault cascades on re-allocation. Includes in-place coalescing in `mbd_realloc` to avoid unnecessary copies.
 - **Advanced Alignment**: Mathematically guaranteed 32-byte minimum alignment natively, plus `mbd_memalign()` for stricter requirements like AVX-512.
 - **Huge Allocations**: Requests over 128 MiB seamlessly bypass the buddy pool and use tracked direct `mmap()`/`munmap()`, skipping redundant `memset` zeroing in `mbd_calloc` for directly-mapped blocks.
 - **Zero Thread-Exit Leaks**: Completely reclaims dead thread caches safely using POSIX thread destructors instead of racy liveness heuristics.
@@ -129,8 +129,10 @@ Use `make test` inside the project to automatically run the suite!
   Sets a custom Out-Of-Memory handler hook.
 - `void mbd_set_profiler_hook(void (*hook)(mbd_event_type_t, void*, size_t));`
   Sets a custom profiler hook.
+- `void mbd_release_to_os(void);`
+  Explicitly returns unused high-order memory (blocks >= 2 MiB) to the operating system using `madvise`.
 - `void mbd_trim(void);`
-  Forces a trim of all thread caches, returning memory to the global arena.
+  Forces a trim of all thread caches, returning memory to the global arena, and subsequently calls `mbd_release_to_os()`.
 - `void mbd_dump(void);`
   Prints the current state of the global free lists for diagnostics.
 

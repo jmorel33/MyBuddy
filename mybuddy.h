@@ -2,11 +2,13 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.7
+ * @version 1.5.0
  * @date April 16, 2026
  * @author Jacques Morel
  *
- * @note v1.4.6 introduces granular thread cache limit configurations
+ * @note v1.5.0 fixes a severe performance bottleneck by removing the madvise
+ *       cascade during coalescing. Adds mbd_release_to_os() for explicit memory release.
+ *       v1.4.6 introduces granular thread cache limit configurations
  *       via `mbd_config_t` and disables `MBD_FLAG_HARDENED` by default
  *       for significant performance gains.
  *       v1.4.5 adds official support for GCC / MinGW-w64 on Windows.
