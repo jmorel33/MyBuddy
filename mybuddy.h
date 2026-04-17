@@ -1060,12 +1060,16 @@ void *mbd_alloc(size_t requested_size) {
         block_header_t *block = data->cache[order];
         data->cache[order] = block->next;
         data->count[order]--;
-        atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-        atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
+            atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+        }
         block->used  = 1;
         block->is_mmap = 0;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-        atomic_fetch_add_explicit(&data->cache_hits, 1, memory_order_relaxed);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_add_explicit(&data->cache_hits, 1, memory_order_relaxed);
+        }
         // Notice: We intentionally do NOT overwrite block->arena.
         block->next = block->prev = NULL;
         void *res = (void *)((uint8_t*)block + HEADER_SIZE);
@@ -1077,7 +1081,7 @@ void *mbd_alloc(size_t requested_size) {
     drain_remote_queue(arena);
 
     if (order <= SMALL_ORDER_MAX) {
-        if (data) {
+        if (data && (global_config.flags & MBD_FLAG_ATOMIC_STATS)) {
             atomic_fetch_add_explicit(&data->cache_misses, 1, memory_order_relaxed);
         }
         refill_thread_cache(data, arena, order);
@@ -1086,8 +1090,10 @@ void *mbd_alloc(size_t requested_size) {
             block_header_t *block = data->cache[order];
             data->cache[order] = block->next;
             data->count[order]--;
-            atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-            atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+            if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+                atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
+                atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+            }
             block->used  = 1;
             block->is_mmap = 0;
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
@@ -1267,8 +1273,10 @@ void mbd_free(void *ptr) {
         block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
-        atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-        atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+            atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+        }
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic pop
 #endif
@@ -1276,7 +1284,9 @@ void mbd_free(void *ptr) {
     }
 
     /* Bulk flush with grouped lock acquisition to prevent thrashing */
-    atomic_fetch_add_explicit(&data->bulk_flushes, 1, memory_order_relaxed);
+    if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+        atomic_fetch_add_explicit(&data->bulk_flushes, 1, memory_order_relaxed);
+    }
     MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, limit / 2);
     mbd_arena_t *locked_arena = NULL;
     int flush_count = limit / 2;
@@ -1304,8 +1314,10 @@ void mbd_free(void *ptr) {
         uint32_t o = to_global->order;
         to_global = coalesce_up_and_update(locked_arena, to_global, &o);
         arena_insert(locked_arena, o, to_global);
-        atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
-        atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
+            atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
+        }
     }
     
     if (locked_arena) {
@@ -1317,8 +1329,10 @@ void mbd_free(void *ptr) {
     block->next = data->cache[order];
     data->cache[order] = block;
     data->count[order]++;
-    atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-    atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+    if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+        atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+        atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+    }
 }
 
 /**
