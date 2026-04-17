@@ -395,6 +395,9 @@ static thread_cache_data_t *global_cache_list = NULL;
 static _Atomic int trim_requested = 0;
 static _Atomic int fully_destroyed = 0;
 static __thread thread_cache_data_t *local_thread_cache = NULL;
+static pthread_mutex_t leaked_blocks_lock = PTHREAD_MUTEX_INITIALIZER;
+static block_header_t *leaked_blocks_head = NULL;
+
 
 
 static pthread_key_t thread_cache_key;
@@ -669,7 +672,10 @@ static void thread_cache_destructor(void *arg) {
                 block_arena->remote_free_queue.head = block;
                 pthread_mutex_unlock(&block_arena->remote_lock);
             } else {
-                // Block leaked if arena is inactive
+                pthread_mutex_lock(&leaked_blocks_lock);
+                block->next = leaked_blocks_head;
+                leaked_blocks_head = block;
+                pthread_mutex_unlock(&leaked_blocks_lock);
             }
         }
     }
@@ -687,7 +693,10 @@ static void thread_cache_destructor(void *arg) {
         cache_arena->remote_free_queue.head = cache_block;
         pthread_mutex_unlock(&cache_arena->remote_lock);
     } else {
-        // Block leaked if arena is inactive
+        pthread_mutex_lock(&leaked_blocks_lock);
+        cache_block->next = leaked_blocks_head;
+        leaked_blocks_head = cache_block;
+        pthread_mutex_unlock(&leaked_blocks_lock);
     }
 
     atomic_fetch_sub(&active_threads, 1);
