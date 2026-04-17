@@ -43,21 +43,33 @@ void st_small_allocs_mbd(double *time_ms) {
 void st_large_allocs_glibc(double *time_ms) {
     int iters = ITERATIONS / 100;
     void **ptrs = malloc(iters * sizeof(void *));
+    size_t *sizes = malloc(iters * sizeof(size_t));
+    unsigned int seed = 42;
+    for (int i = 0; i < iters; i++) {
+        sizes[i] = (rand_r(&seed) % (128 * 1024)) + 4096; // Random sizes between 4KB and ~132KB
+    }
     double start = get_time_ms();
-    for (int i = 0; i < iters; i++) ptrs[i] = malloc(1024 * 64);
+    for (int i = 0; i < iters; i++) ptrs[i] = malloc(sizes[i]);
     for (int i = 0; i < iters; i++) free(ptrs[i]);
     *time_ms = get_time_ms() - start;
     free(ptrs);
+    free(sizes);
 }
 
 void st_large_allocs_mbd(double *time_ms) {
     int iters = ITERATIONS / 100;
     void **ptrs = malloc(iters * sizeof(void *));
+    size_t *sizes = malloc(iters * sizeof(size_t));
+    unsigned int seed = 42;
+    for (int i = 0; i < iters; i++) {
+        sizes[i] = (rand_r(&seed) % (128 * 1024)) + 4096; // Random sizes between 4KB and ~132KB
+    }
     double start = get_time_ms();
-    for (int i = 0; i < iters; i++) ptrs[i] = mbd_alloc(1024 * 64);
+    for (int i = 0; i < iters; i++) ptrs[i] = mbd_alloc(sizes[i]);
     for (int i = 0; i < iters; i++) mbd_free(ptrs[i]);
     *time_ms = get_time_ms() - start;
     free(ptrs);
+    free(sizes);
 }
 
 // Multi-thread small allocations
@@ -206,7 +218,7 @@ int main() {
     printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
 
     // Phase 2: Single-thread Large Allocations
-    printf("\n[2] Single-Thread Large Allocs (64KB)\n");
+    printf("\n[2] Single-Thread Large Allocs (Random 4KB-132KB)\n");
     st_large_allocs_glibc(&glibc_time);
     printf("    glibc:   %8.2f ms\n", glibc_time);
     st_large_allocs_mbd(&mbd_time);

@@ -2,11 +2,14 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.4.5
- * @date April 14, 2026
+ * @version 1.4.6
+ * @date April 16, 2026
  * @author Jacques Morel
  *
- * @note v1.4.5 adds official support for GCC / MinGW-w64 on Windows.
+ * @note v1.4.6 introduces granular thread cache limit configurations
+ *       via `mbd_config_t` and disables `MBD_FLAG_HARDENED` by default
+ *       for significant performance gains.
+ *       v1.4.5 adds official support for GCC / MinGW-w64 on Windows.
  *       Same API, same safety, same performance characteristics.
  *       Uses winpthreads + native mmap emulation. No MSVC support yet.
  *
@@ -29,7 +32,7 @@
  * - **Starvation Immunity**: If a thread's native arena runs dry, it automatically migrates and binds to an arena with available memory.
  *
  * @section usage Usage Scenarios
- * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX = 13`.
+ * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX` (defaults to 16).
  * - **Large objects** (8 KiB - 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
  * - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
  *
@@ -81,15 +84,22 @@ extern "C" {
 #define MBD_FLAG_BUDDY_LARGE       (1u << 2)  // 3. Use buddy system for blocks > SMALL_ORDER_MAX (OFF = direct mmap)
 #define MBD_FLAG_REALLOC_LOCK      (1u << 3)  // 4. Take lock even on realloc shrinks (OFF = early return)
 
+#ifndef MAX_ORDER
+#define MAX_ORDER          27
+#endif
+#ifndef MIN_ORDER
+#define MIN_ORDER          6              // 64 bytes minimum block size
+#endif
+#ifndef SMALL_ORDER_MAX
+#define SMALL_ORDER_MAX    16             // Includes 4 KiB pages
+#endif
+
 typedef struct {
     uint32_t flags;
     int arena_count;
     size_t pool_size;
+    uint32_t cache_limits[SMALL_ORDER_MAX + 1];
 } mbd_config_t;
-
-#define MAX_ORDER          27
-#define MIN_ORDER          6              // 64 bytes minimum block size
-#define SMALL_ORDER_MAX    13             // Includes 4 KiB pages
 /* -- Public API -------------------------------------------------------------- */
 
 /**
@@ -412,6 +422,7 @@ static inline int arena_index(const mbd_arena_t *a) {
  * @return uint32_t The encoded magic value.
  */
 static inline uint32_t encode_magic(void *block, uint32_t magic) {
+    if (!(global_config.flags & MBD_FLAG_HARDENED)) return magic;
     // Improved address hash with better diffusion (xxhash32-inspired)
     uintptr_t addr = (uintptr_t)block;
     uint32_t h = (uint32_t)(addr ^ (addr >> 32));
@@ -469,10 +480,8 @@ static void arena_remove(mbd_arena_t *arena, block_header_t *block, uint32_t ord
  * ================================================================== */
 
 static inline uint32_t get_cache_limit(uint32_t order) {
-    if (order <= 8)  return 256; /* <= 256 B: store 256 objects */
-    if (order <= 10) return 64;  /* <= 1 KiB: store 64 objects */
-    if (order <= 12) return 32;  /* <= 4 KiB: store 32 objects */
-    return 16;                   /* > 4 KiB: store 16 objects */
+    if (order > SMALL_ORDER_MAX) return 0;
+    return global_config.cache_limits[order];
 }
 
 static inline uint32_t next_power_of_two_order(size_t req) {
@@ -671,6 +680,25 @@ static mbd_arena_t static_arenas[MBD_MAX_ARENAS];
 static void internal_init(void) {
     if (atomic_load(&config_set)) {
         global_config = pending_config;
+    }
+    int limits_uninitialized = 1;
+    for (uint32_t i = 0; i <= SMALL_ORDER_MAX; i++) {
+        if (global_config.cache_limits[i] != 0) {
+            limits_uninitialized = 0;
+            break;
+        }
+    }
+
+    // We assume limits are uninitialized only if all limits are 0.
+    // If a user genuinely wants to disable the cache by setting everything to 0,
+    // they can just set SMALL_ORDER_MAX to 0. Otherwise this defaults behavior.
+    if (limits_uninitialized) {
+        for (uint32_t order = 0; order <= SMALL_ORDER_MAX; order++) {
+            if (order <= 8)  global_config.cache_limits[order] = 256;
+            else if (order <= 10) global_config.cache_limits[order] = 64;
+            else if (order <= 12) global_config.cache_limits[order] = 32;
+            else global_config.cache_limits[order] = 16;
+        }
     }
     if (global_config.pool_size == 0) {
         global_config.pool_size = (1ULL << 27);
@@ -1032,12 +1060,16 @@ void *mbd_alloc(size_t requested_size) {
         block_header_t *block = data->cache[order];
         data->cache[order] = block->next;
         data->count[order]--;
-        atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-        atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
+            atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+        }
         block->used  = 1;
         block->is_mmap = 0;
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-        atomic_fetch_add_explicit(&data->cache_hits, 1, memory_order_relaxed);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_add_explicit(&data->cache_hits, 1, memory_order_relaxed);
+        }
         // Notice: We intentionally do NOT overwrite block->arena.
         block->next = block->prev = NULL;
         void *res = (void *)((uint8_t*)block + HEADER_SIZE);
@@ -1049,7 +1081,7 @@ void *mbd_alloc(size_t requested_size) {
     drain_remote_queue(arena);
 
     if (order <= SMALL_ORDER_MAX) {
-        if (data) {
+        if (data && (global_config.flags & MBD_FLAG_ATOMIC_STATS)) {
             atomic_fetch_add_explicit(&data->cache_misses, 1, memory_order_relaxed);
         }
         refill_thread_cache(data, arena, order);
@@ -1058,8 +1090,10 @@ void *mbd_alloc(size_t requested_size) {
             block_header_t *block = data->cache[order];
             data->cache[order] = block->next;
             data->count[order]--;
-            atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-            atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+            if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+                atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
+                atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
+            }
             block->used  = 1;
             block->is_mmap = 0;
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
@@ -1223,6 +1257,14 @@ void mbd_free(void *ptr) {
 
 
 
+    // GCC warns about out-of-bounds access for `data->count[order]`.
+    // We already check `if (order > SMALL_ORDER_MAX)` and early-return above.
+    // So order is strictly <= SMALL_ORDER_MAX.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
+
     uint32_t limit = get_cache_limit(order);
     if (data->count[order] < limit) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << block->order);
@@ -1231,13 +1273,20 @@ void mbd_free(void *ptr) {
         block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
-        atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-        atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+            atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+        }
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         return;
     }
 
     /* Bulk flush with grouped lock acquisition to prevent thrashing */
-    atomic_fetch_add_explicit(&data->bulk_flushes, 1, memory_order_relaxed);
+    if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+        atomic_fetch_add_explicit(&data->bulk_flushes, 1, memory_order_relaxed);
+    }
     MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, limit / 2);
     mbd_arena_t *locked_arena = NULL;
     int flush_count = limit / 2;
@@ -1265,8 +1314,10 @@ void mbd_free(void *ptr) {
         uint32_t o = to_global->order;
         to_global = coalesce_up_and_update(locked_arena, to_global, &o);
         arena_insert(locked_arena, o, to_global);
-        atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
-        atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
+        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+            atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
+            atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
+        }
     }
     
     if (locked_arena) {
@@ -1278,8 +1329,10 @@ void mbd_free(void *ptr) {
     block->next = data->cache[order];
     data->cache[order] = block;
     data->count[order]++;
-    atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-    atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+    if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+        atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
+        atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+    }
 }
 
 /**
