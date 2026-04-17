@@ -270,7 +270,16 @@ void mbd_dump(void);
 #include <pthread.h>
 #include <stdlib.h>
 #if defined(__MINGW32__) || defined(__MINGW64__)
-// MinGW-specific mmap/unistd fallbacks would go here if needed, or user includes winpthreads + native mapping logic in implementation
+#include <windows.h>
+#define mmap(a,b,c,d,e,f) VirtualAlloc(a, b, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE)
+#define munmap(a,b) VirtualFree(a, 0, MEM_RELEASE)
+#define sysconf(x) (4096)
+#define MAP_FAILED NULL
+#define PROT_READ 0
+#define PROT_WRITE 0
+#define MAP_PRIVATE 0
+#define MAP_ANONYMOUS 0
+#define MAP_NORESERVE 0
 #else
 #include <unistd.h>
 #include <sys/mman.h>
@@ -395,8 +404,7 @@ static thread_cache_data_t *global_cache_list = NULL;
 static _Atomic int trim_requested = 0;
 static _Atomic int fully_destroyed = 0;
 static __thread thread_cache_data_t *local_thread_cache = NULL;
-static pthread_mutex_t leaked_blocks_lock = PTHREAD_MUTEX_INITIALIZER;
-static block_header_t *leaked_blocks_head = NULL;
+
 
 
 
@@ -671,11 +679,6 @@ static void thread_cache_destructor(void *arg) {
                 atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
                 block_arena->remote_free_queue.head = block;
                 pthread_mutex_unlock(&block_arena->remote_lock);
-            } else {
-                pthread_mutex_lock(&leaked_blocks_lock);
-                block->next = leaked_blocks_head;
-                leaked_blocks_head = block;
-                pthread_mutex_unlock(&leaked_blocks_lock);
             }
         }
     }
@@ -692,11 +695,6 @@ static void thread_cache_destructor(void *arg) {
         atomic_store_explicit(&cache_block->magic, encode_magic(cache_block, MAGIC_FREE), memory_order_release);
         cache_arena->remote_free_queue.head = cache_block;
         pthread_mutex_unlock(&cache_arena->remote_lock);
-    } else {
-        pthread_mutex_lock(&leaked_blocks_lock);
-        cache_block->next = leaked_blocks_head;
-        leaked_blocks_head = cache_block;
-        pthread_mutex_unlock(&leaked_blocks_lock);
     }
 
     atomic_fetch_sub(&active_threads, 1);
@@ -994,6 +992,14 @@ void mbd_destroy(void) {
 
     assert(atomic_load(&active_threads) == 0 && "mbd_destroy called while other threads are active!");
     
+    while (atomic_load(&active_threads) > 0) {
+#if defined(_WIN32) || defined(__CYGWIN__) || defined(__MINGW32__) || defined(__MINGW64__)
+        Sleep(1);
+#else
+        usleep(1000);
+#endif
+    }
+
     for (int a = 0; a < arena_count; a++) {
         atomic_store(&arenas[a].active, 0);
     }
