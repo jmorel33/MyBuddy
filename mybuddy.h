@@ -81,9 +81,15 @@ extern "C" {
 #define MBD_FLAG_BUDDY_LARGE       (1u << 2)  // 3. Use buddy system for blocks > SMALL_ORDER_MAX (OFF = direct mmap)
 #define MBD_FLAG_REALLOC_LOCK      (1u << 3)  // 4. Take lock even on realloc shrinks (OFF = early return)
 
+#ifndef MAX_ORDER
 #define MAX_ORDER          27
+#endif
+#ifndef MIN_ORDER
 #define MIN_ORDER          6              // 64 bytes minimum block size
+#endif
+#ifndef SMALL_ORDER_MAX
 #define SMALL_ORDER_MAX    16             // Includes 4 KiB pages
+#endif
 
 typedef struct {
     uint32_t flags;
@@ -671,15 +677,18 @@ static void internal_init(void) {
     if (atomic_load(&config_set)) {
         global_config = pending_config;
     }
-    int has_custom_limits = 0;
+    int limits_uninitialized = 1;
     for (uint32_t i = 0; i <= SMALL_ORDER_MAX; i++) {
         if (global_config.cache_limits[i] != 0) {
-            has_custom_limits = 1;
+            limits_uninitialized = 0;
             break;
         }
     }
 
-    if (!has_custom_limits) {
+    // We assume limits are uninitialized only if all limits are 0.
+    // If a user genuinely wants to disable the cache by setting everything to 0,
+    // they can just set SMALL_ORDER_MAX to 0. Otherwise this defaults behavior.
+    if (limits_uninitialized) {
         for (uint32_t order = 0; order <= SMALL_ORDER_MAX; order++) {
             if (order <= 8)  global_config.cache_limits[order] = 256;
             else if (order <= 10) global_config.cache_limits[order] = 64;
@@ -1238,7 +1247,14 @@ void mbd_free(void *ptr) {
 
 
 
-    if (order > SMALL_ORDER_MAX) __builtin_unreachable();
+    // GCC warns about out-of-bounds access for `data->count[order]`.
+    // We already check `if (order > SMALL_ORDER_MAX)` and early-return above.
+    // So order is strictly <= SMALL_ORDER_MAX.
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Warray-bounds"
+#endif
+
     uint32_t limit = get_cache_limit(order);
     if (data->count[order] < limit) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << block->order);
@@ -1249,6 +1265,9 @@ void mbd_free(void *ptr) {
         data->count[order]++;
         atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
         atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
+#if defined(__GNUC__) && !defined(__clang__)
+#pragma GCC diagnostic pop
+#endif
         return;
     }
 
