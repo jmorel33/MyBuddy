@@ -6,7 +6,9 @@
  * @date April 17, 2026
  * @author Jacques Morel
  *
- * @note v1.4.8 fixes a severe performance bottleneck by removing the madvise
+ * @note v1.4.9 extends the thread cache to 1 MiB (order 20) and populates
+ *       intermediate sizes during splits to eliminate cross-order cache thrashing.
+ *       v1.4.8 fixes a severe performance bottleneck by removing the madvise
  *       cascade during coalescing. Adds mbd_release_to_os() for explicit memory release.
  *       v1.4.6 introduces granular thread cache limit configurations
  *       via `mbd_config_t` and disables `MBD_FLAG_HARDENED` by default
@@ -20,7 +22,7 @@
  * guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching.
  *
  * @section features Key Strengths
- * - **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles.
+ * - **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 1 MiB in just a few CPU cycles.
  * - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks.
  * - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation, and defused memalign exploits.
  * - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` to prevent memory hoarding.
@@ -34,7 +36,7 @@
  * - **Starvation Immunity**: If a thread's native arena runs dry, it automatically migrates and binds to an arena with available memory.
  *
  * @section usage Usage Scenarios
- * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX` (defaults to 16).
+ * - **Tiny/Medium/Large objects** (strings, ECS entities, up to 1 MiB assets): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX` (defaults to 20).
  * - **Large objects** (8 KiB - 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
  * - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
  *
@@ -797,12 +799,14 @@ static void internal_init(void) {
     /* ── Default cache limit table (performance-oriented, user-overridable) ── */
     if (limits_uninitialized) {
         for (uint32_t order = 0; order <= SMALL_ORDER_MAX; order++) {
-            if (order <= 8)       global_config.cache_limits[order] = 256;  /* <= 256 B     */
-            else if (order <= 10) global_config.cache_limits[order] = 64;   /* <= 1 KiB     */
-            else if (order <= 12) global_config.cache_limits[order] = 32;   /* <= 4 KiB     */
-            else if (order <= 15) global_config.cache_limits[order] = 16;   /* 8-32 KiB     */
-            else if (order <= 18) global_config.cache_limits[order] = 8;    /* 64-256 KiB   */
-            else                  global_config.cache_limits[order] = 4;    /* 512 KiB-1MB  */
+            if (order <= 8)       global_config.cache_limits[order] = 512;  /* <= 256 B     */
+            else if (order <= 10) global_config.cache_limits[order] = 256;  /* <= 1 KiB     */
+            else if (order <= 12) global_config.cache_limits[order] = 128;  /* <= 4 KiB     */
+            else if (order <= 14) global_config.cache_limits[order] = 64;   /* 8-16 KiB     */
+            else if (order <= 16) global_config.cache_limits[order] = 32;   /* 32-64 KiB    */
+            else if (order <= 18) global_config.cache_limits[order] = 16;   /* 128-256 KiB  */
+            else if (order <= 19) global_config.cache_limits[order] = 8;    /* 512 KiB      */
+            else                  global_config.cache_limits[order] = 4;    /* 1 MiB        */
         }
     }
     if (global_config.pool_size == 0) {
@@ -1003,13 +1007,44 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
         if (!block) {
             uint32_t cur = order + 1;
             while (cur <= MAX_ORDER && !locked_arena->free_lists[cur]) cur++;
-            if (cur > MAX_ORDER) {
-                break;
-            }
+            if (cur > MAX_ORDER) break;
 
             block = locked_arena->free_lists[cur];
             arena_remove(locked_arena, block, cur);
-            block = split_block_down(locked_arena, block, order);
+
+            /* Custom split that populates the thread cache for intermediate sizes */
+            uint32_t split_count = 0;
+            while (block->order > order) {
+                uint32_t new_order = block->order - 1;
+                block_header_t *buddy = get_buddy(locked_arena, block, new_order);
+                buddy->order = new_order;
+                buddy->used  = 0;
+                buddy->is_mmap = 0;
+                buddy->arena = locked_arena;
+                buddy->next = buddy->prev = NULL;
+
+                /* If the buddy is cacheable, put it directly in the thread cache! */
+                if (new_order <= SMALL_ORDER_MAX && data->count[new_order] < get_cache_limit(new_order)) {
+                    atomic_store_explicit(&buddy->magic, encode_magic(buddy, MAGIC_CACHED), memory_order_release);
+                    buddy->next = data->cache[new_order];
+                    data->cache[new_order] = buddy;
+                    data->count[new_order]++;
+                    if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+                        atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << new_order);
+                    }
+                } else {
+                    atomic_store_explicit(&buddy->magic, encode_magic(buddy, MAGIC_FREE), memory_order_release);
+                    arena_insert(locked_arena, new_order, buddy);
+                }
+                block->order = new_order;
+                split_count++;
+            }
+
+            /* Update split stats */
+            if (split_count > 0) {
+                atomic_fetch_add(&locked_arena->splits, split_count);
+                MBD_FIRE_EVENT(MBD_EVENT_SPLIT, block, split_count);
+            }
         } else {
             arena_remove(locked_arena, block, order);
         }
