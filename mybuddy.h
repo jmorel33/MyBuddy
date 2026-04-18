@@ -120,6 +120,10 @@ typedef struct {
     int arena_count;
     size_t pool_size;
     uint32_t cache_limits[SMALL_ORDER_MAX + 1];
+    /* Controls how much larger a cached mmap block can be compared to the requested size.
+     * e.g., 4 means a cached block can be up to 4x the requested size.
+     * 1 means exact-fit only. 0 means disable the mmap cache entirely. */
+    uint32_t mmap_max_waste_ratio;
 } mbd_config_t;
 /* -- Public API -------------------------------------------------------------- */
 
@@ -844,6 +848,10 @@ static void internal_init(void) {
         }
     }
     
+    if (global_config.mmap_max_waste_ratio == 0) {
+        global_config.mmap_max_waste_ratio = 4; // Default to 4x waste tolerance
+    }
+
     // We assume limits are uninitialized only if all limits are 0.
     // If a user genuinely wants to disable the cache by setting everything to 0,
     // they can just set SMALL_ORDER_MAX to 0. Otherwise this defaults behavior.
@@ -1245,7 +1253,7 @@ void *mbd_alloc(size_t requested_size) {
             size_t best_size = SIZE_MAX;
             for (uint32_t i = 0; i < data->mmap_cache_count; i++) {
                 size_t bsize = data->mmap_cache[i]->mmap_size;
-                if (bsize >= needed && bsize <= needed * 4 && bsize < best_size) {
+                if (bsize >= needed && bsize <= needed * global_config.mmap_max_waste_ratio && bsize < best_size) {
                     best_idx = (int)i;
                     best_size = bsize;
                     if (bsize == needed) break; // Exact match!
