@@ -766,7 +766,6 @@ static void thread_cache_destructor(void *arg) {
             }
 
             if (atomic_load(&block_arena->active)) {
-                atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
                 remote_push(block_arena, block);
             }
         }
@@ -779,7 +778,6 @@ static void thread_cache_destructor(void *arg) {
     mbd_arena_t *cache_arena = cache_block->arena;
 
     if (atomic_load(&cache_arena->active)) {
-        atomic_store_explicit(&cache_block->magic, encode_magic(cache_block, MAGIC_FREE), memory_order_release);
         remote_push(cache_arena, cache_block);
     }
 
@@ -1071,6 +1069,7 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
         block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
+        data->total_cached += (1ULL << order);
         if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
             atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << order);
         }
@@ -1473,29 +1472,29 @@ void mbd_free(void *ptr) {
             data->count[o]--;
             data->total_cached -= (1ULL << o);
 
-        mbd_arena_t *block_arena = to_global->arena;
+            mbd_arena_t *block_arena = to_global->arena;
 
-        if (locked_arena != block_arena) {
-            if (locked_arena) {
-                pthread_mutex_unlock(&locked_arena->lock);
+            if (locked_arena != block_arena) {
+                if (locked_arena) {
+                    pthread_mutex_unlock(&locked_arena->lock);
+                }
+                locked_arena = block_arena;
+                pthread_mutex_lock(&locked_arena->lock);
+                drain_remote_queue(locked_arena);
             }
-            locked_arena = block_arena;
-            pthread_mutex_lock(&locked_arena->lock);
-            drain_remote_queue(locked_arena);
-        }
 
-        to_global->flags = 0;
-        atomic_store_explicit(&to_global->magic, encode_magic(to_global, MAGIC_FREE), memory_order_release);
+            to_global->flags = 0;
+            atomic_store_explicit(&to_global->magic, encode_magic(to_global, MAGIC_FREE), memory_order_release);
 
-        uint32_t original_order = to_global->order;
-        uint32_t coalesced_order = original_order;
-        to_global = coalesce_up_and_update(locked_arena, to_global, &coalesced_order);
-        arena_insert(locked_arena, coalesced_order, to_global);
-        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
-            atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
-            atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
+            uint32_t original_order = to_global->order;
+            uint32_t coalesced_order = original_order;
+            to_global = coalesce_up_and_update(locked_arena, to_global, &coalesced_order);
+            arena_insert(locked_arena, coalesced_order, to_global);
+            if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
+                atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
+                atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
+            }
         }
-    }
     } // End of o loop
     
     if (locked_arena) {
@@ -1592,6 +1591,10 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         MBD_FIRE_EVENT(MBD_EVENT_COALESCE, buddy, block->order);
 
         block->order += 1;
+
+        if (!(buddy->flags & BLOCK_FRESH)) {
+            block->flags &= ~BLOCK_FRESH;
+        }
     }
     
     atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
@@ -1629,7 +1632,9 @@ void *mbd_calloc(size_t nmemb, size_t size) {
     if (ptr) {
         block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
         if (!(block->flags & BLOCK_IS_MMAP)) {
-            if (!(block->flags & BLOCK_FRESH)) {
+            if (block->flags & BLOCK_FRESH) {
+                block->flags &= ~BLOCK_FRESH;
+            } else {
                 memset(ptr, 0, total);
             }
         }
