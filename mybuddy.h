@@ -1424,8 +1424,7 @@ void mbd_free(void *ptr) {
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
         if (m != encode_magic(block, MAGIC_ALLOC) &&
-            m != encode_magic(block, MAGIC_MMAP) &&
-            m != encode_magic(block, MAGIC_CACHED_MMAP)) {
+            m != encode_magic(block, MAGIC_MMAP)) {
             fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
             abort();
         }
@@ -1622,7 +1621,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
 
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
-        if (m != encode_magic(block, MAGIC_ALLOC) && m != encode_magic(block, MAGIC_MMAP) && m != encode_magic(block, MAGIC_CACHED_MMAP)) abort();
+        if (m != encode_magic(block, MAGIC_ALLOC) && m != encode_magic(block, MAGIC_MMAP)) abort();
 
         size_t old_usable = block->mmap_size - HEADER_SIZE;
         if (new_size <= old_usable) return ptr;
@@ -1764,7 +1763,7 @@ size_t mbd_malloc_usable_size(const void *ptr) {
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
-        if (m == encode_magic(block, MAGIC_ALLOC) || m == encode_magic(block, MAGIC_MMAP) || m == encode_magic(block, MAGIC_CACHED_MMAP))
+        if (m == encode_magic(block, MAGIC_ALLOC) || m == encode_magic(block, MAGIC_MMAP))
             return block->mmap_size - HEADER_SIZE;
     }
 
