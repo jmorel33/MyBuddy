@@ -503,6 +503,7 @@ static const uint32_t MAGIC_FREE     = 0xDEADBEEF;
 static const uint32_t MAGIC_CACHED   = 0xBAADF00D;
 static const uint32_t MAGIC_MEMALIGN = 0x00000A11;
 static const uint32_t MAGIC_MMAP     = 0x8BADF00D;
+static const uint32_t MAGIC_CACHED_MMAP = 0xF00DCAFE;
 
 static uint32_t mbd_secret_key = 0;
 
@@ -1140,17 +1141,13 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
 static pthread_mutex_t init_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 void mbd_init(const mbd_config_t *config) {
-    if (config) {
-        pthread_mutex_lock(&init_mutex);
-        if (!atomic_load(&config_set)) {
-            pending_config = *config;
-            atomic_store(&config_set, 1);
-        }
-        pthread_once(&init_once, internal_init);
-        pthread_mutex_unlock(&init_mutex);
-    } else {
-        pthread_once(&init_once, internal_init);
+    pthread_mutex_lock(&init_mutex);
+    if (config && !atomic_load(&config_set)) {
+        pending_config = *config;
+        atomic_store(&config_set, 1);
     }
+    pthread_once(&init_once, internal_init);
+    pthread_mutex_unlock(&init_mutex);
 }
 
 /**
@@ -1241,7 +1238,7 @@ void *mbd_alloc(size_t requested_size) {
             size_t best_size = SIZE_MAX;
             for (uint32_t i = 0; i < data->mmap_cache_count; i++) {
                 size_t bsize = data->mmap_cache[i]->mmap_size;
-                if (bsize >= needed && bsize < best_size) {
+                if (bsize >= needed && bsize <= needed * 4 && bsize < best_size) {
                     best_idx = (int)i;
                     best_size = bsize;
                     if (bsize == needed) break; // Exact match!
@@ -1427,7 +1424,8 @@ void mbd_free(void *ptr) {
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
         if (m != encode_magic(block, MAGIC_ALLOC) &&
-            m != encode_magic(block, MAGIC_MMAP)) {
+            m != encode_magic(block, MAGIC_MMAP) &&
+            m != encode_magic(block, MAGIC_CACHED_MMAP)) {
             fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
             abort();
         }
@@ -1435,10 +1433,12 @@ void mbd_free(void *ptr) {
         thread_cache_data_t *data = atomic_load(&fully_destroyed) ? NULL : pthread_getspecific(thread_cache_key);
         // Push to thread-local mmap cache to avoid munmap syscall!
         if (data && data->mmap_cache_count < 8) {
-            atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
+            atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED_MMAP), memory_order_release);
             data->mmap_cache[data->mmap_cache_count++] = block;
             return;
         }
+        // Transition to free to prevent caching double frees natively
+        atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
         // Cache full, return to OS
         size_t mmap_size = block->mmap_size;
         atomic_fetch_sub(&huge_mmap_tracked, mmap_size);
@@ -1468,8 +1468,7 @@ void mbd_free(void *ptr) {
     if (order > SMALL_ORDER_MAX) {
         pthread_mutex_lock(&arena->lock);
         drain_remote_queue(arena);
-        uint8_t fresh_state = atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_FRESH;
-        atomic_store_explicit(&block->flags, fresh_state, memory_order_relaxed);
+        atomic_store_explicit(&block->flags, 0, memory_order_relaxed);
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
 
         block = coalesce_up_and_update(arena, block, &order);
@@ -1623,7 +1622,7 @@ void *mbd_realloc(void *ptr, size_t new_size) {
 
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
-        if (m != encode_magic(block, MAGIC_ALLOC) && m != encode_magic(block, MAGIC_MMAP)) abort();
+        if (m != encode_magic(block, MAGIC_ALLOC) && m != encode_magic(block, MAGIC_MMAP) && m != encode_magic(block, MAGIC_CACHED_MMAP)) abort();
 
         size_t old_usable = block->mmap_size - HEADER_SIZE;
         if (new_size <= old_usable) return ptr;
@@ -1765,7 +1764,7 @@ size_t mbd_malloc_usable_size(const void *ptr) {
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
-        if (m == encode_magic(block, MAGIC_ALLOC) || m == encode_magic(block, MAGIC_MMAP))
+        if (m == encode_magic(block, MAGIC_ALLOC) || m == encode_magic(block, MAGIC_MMAP) || m == encode_magic(block, MAGIC_CACHED_MMAP))
             return block->mmap_size - HEADER_SIZE;
     }
 
@@ -1921,6 +1920,7 @@ mbd_stats_t mbd_get_stats(void) {
 void mbd_dump(void) {
     for (int a = 0; a < arena_count; a++) {
         pthread_mutex_lock(&arenas[a].lock);
+        drain_remote_queue(&arenas[a]);
         printf("\n=== Arena %d Free Lists ===\n", a);
         for (int i = MIN_ORDER; i <= MAX_ORDER; i++) {
             int count = 0;
