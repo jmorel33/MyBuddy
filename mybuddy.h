@@ -2,8 +2,8 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.5.0
- * @date April 16, 2026
+ * @version 1.4.9
+ * @date April 17, 2026
  * @author Jacques Morel
  *
  * @note v1.4.8 fixes a severe performance bottleneck by removing the madvise
