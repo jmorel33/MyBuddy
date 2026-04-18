@@ -2,13 +2,14 @@
   <img src="MyBuddy.jpg" alt="K-Term Logo" width="1024">
 </div>
 
-**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.8)
+**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.5.0)
 
 MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high-performance C/C++ applications. It combines the anti-fragmentation guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching. It is designed with 32-byte SIMD-safe alignment, zero thread-exit leaks, hardened safety, and is LD_PRELOAD-ready.
 
 ## Key Features
 
-- **Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles. Dynamic per-order cache sizing limits ensure optimal memory utilization.
+- **Fast**: Lock-free thread-local cache delivers allocations up to 1 MiB in just a few CPU cycles, massively boosting performance for large operations. Dynamic per-order cache sizing limits ensure optimal memory utilization.
+- **Lock-Free Fast Paths**: Features atomic, non-blocking pre-checks for cross-arena queue draining, virtually eliminating uncontended mutex overhead.
 - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks. ThreadSanitizer (TSAN) clean, utilizing safe `_Atomic` lock-free checks across the header to eliminate concurrent coalescing race conditions. Includes a robust mutex-protected remote free queue for cross-arena allocations.
 - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation using a global randomized XOR entropy key to mitigate heap corruption, and defused memalign exploits.
 - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via an explicit `mbd_release_to_os()` call, which utilizes `madvise` (preferring `MADV_FREE` on Linux, falling back to `MADV_DONTNEED`) to lazily release memory while keeping the buddy pool warm to prevent hard page fault cascades on re-allocation. Includes in-place coalescing in `mbd_realloc` to avoid unnecessary copies.
