@@ -2,7 +2,7 @@
   <img src="MyBuddy.jpg" alt="K-Term Logo" width="1024">
 </div>
 
-**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.4.9)
+**High-performance lock-free thread-caching buddy allocator for C/C++.** (v1.5.0-PRE3)
 
 MyBuddy (MBd) is a production-grade, highly concurrent memory allocator for high-performance C/C++ applications. It combines the anti-fragmentation guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching. It is designed with 32-byte SIMD-safe alignment, zero thread-exit leaks, hardened safety, and is LD_PRELOAD-ready.
 
@@ -106,6 +106,31 @@ If you want to run extensive tests with multithreaded extreme load cases, the te
 Use `make test` inside the project to automatically run the suite!
 
 *Note: The allocator is self-initializing. The first call to `mbd_alloc()` or `mbd_free()` will automatically initialize the pool. For latency-sensitive applications, you may still call `mbd_init()` explicitly during startup.*
+
+## Configuration Settings
+
+The allocator can be configured globally by passing an `mbd_config_t` struct to `mbd_init`. If passed as `NULL`, or if the allocator auto-initializes, safe performance-oriented defaults are used.
+
+```c
+typedef struct {
+    uint32_t flags;
+    int arena_count;
+    size_t pool_size;
+    uint32_t cache_limits[SMALL_ORDER_MAX + 1];
+    uint32_t mmap_max_waste_ratio;
+} mbd_config_t;
+```
+
+- **`flags`**: Bitmask for allocator flags. Available options:
+  - `MBD_FLAG_HARDENED`: Enables bounds checking, XOR check-summed header validation, and double-free protection. (Disabled by default due to performance overhead).
+  - `MBD_FLAG_ATOMIC_STATS`: Enables atomic tracking of stats like cache hits and misses. (Enabled by default).
+  - `MBD_FLAG_REALLOC_LOCK`: Enables briefly taking the arena lock during `realloc` for possible coalescing (Enabled by default).
+  - `MBD_FLAG_MADV_RELEASE`: Enables using `MADV_FREE` / `MADV_DONTNEED` to eagerly release pages to the OS. (Enabled by default).
+  - `MBD_FLAG_BUDDY_LARGE`: Forces the buddy allocator to handle all allocation sizes up to max order. Disables exact-fit direct mmap. (Disabled by default).
+- **`arena_count`**: The number of independent arenas to partition memory across. Defaults to the number of CPU cores minus one.
+- **`pool_size`**: The total reservation capacity in bytes per arena.
+- **`cache_limits`**: An array dictating the maximum number of blocks a thread cache can hold for each buddy order size. Tuned to prevent thrashing. (If array is empty, defaults are applied).
+- **`mmap_max_waste_ratio`**: Controls how much larger a cached mmap block can be compared to the requested size (e.g. 4 means up to 4x). A value of 1 enforces exact-fit. A value of 0 defaults to 4.
 
 ## API Reference
 
