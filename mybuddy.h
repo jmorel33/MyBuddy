@@ -492,6 +492,7 @@ static const uint32_t MAGIC_FREE     = 0xDEADBEEF;
 static const uint32_t MAGIC_CACHED   = 0xBAADF00D;
 static const uint32_t MAGIC_MEMALIGN = 0x00000A11;
 static const uint32_t MAGIC_MMAP     = 0x8BADF00D;
+static const uint32_t MAGIC_MMAP_CACHED = 0xD15EA5ED;
 
 static uint32_t mbd_secret_key = 0;
 
@@ -1196,18 +1197,27 @@ void *mbd_alloc(size_t requested_size) {
         
         // Check thread-local mmap cache first to avoid syscalls!
         if (data) {
+            int best_idx = -1;
+            size_t best_size = SIZE_MAX;
             for (uint32_t i = 0; i < data->mmap_cache_count; i++) {
-                if (data->mmap_cache[i]->mmap_size >= needed) {
-                    block_header_t *block = data->mmap_cache[i];
-                    data->mmap_cache[i] = data->mmap_cache[--data->mmap_cache_count];
-                    
-                    block->flags = BLOCK_IS_MMAP;
-                    atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
-                    
-                    void *res = (void *)((uint8_t*)block + HEADER_SIZE);
-                    MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
-                    return res;
+                size_t bsize = data->mmap_cache[i]->mmap_size;
+                if (bsize >= needed && bsize < best_size) {
+                    best_idx = (int)i;
+                    best_size = bsize;
+                    if (bsize == needed) break; // Exact match!
                 }
+            }
+
+            if (best_idx >= 0) {
+                block_header_t *block = data->mmap_cache[best_idx];
+                data->mmap_cache[best_idx] = data->mmap_cache[--data->mmap_cache_count];
+
+                block->flags = BLOCK_IS_MMAP;
+                atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
+
+                void *res = (void *)((uint8_t*)block + HEADER_SIZE);
+                MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
+                return res;
             }
         }
         
@@ -1382,11 +1392,19 @@ void mbd_free(void *ptr) {
         return;
     }
 
-    if ((block->flags & BLOCK_IS_MMAP) && load_magic(block) == encode_magic(block, MAGIC_MMAP)) {
+    if (block->flags & BLOCK_IS_MMAP) {
+        uint32_t m = load_magic(block);
+        if (m != encode_magic(block, MAGIC_ALLOC) &&
+            m != encode_magic(block, MAGIC_MMAP) &&
+            m != encode_magic(block, MAGIC_MMAP_CACHED)) {
+            fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
+            abort();
+        }
+
         thread_cache_data_t *data = atomic_load(&fully_destroyed) ? NULL : pthread_getspecific(thread_cache_key);
         // Push to thread-local mmap cache to avoid munmap syscall!
         if (data && data->mmap_cache_count < 8) {
-            atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
+            atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_MMAP_CACHED), memory_order_release);
             data->mmap_cache[data->mmap_cache_count++] = block;
             return;
         }
@@ -1593,7 +1611,10 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return new_ptr;
     }
 
-    if ((block->flags & BLOCK_IS_MMAP) && load_magic(block) == encode_magic(block, MAGIC_MMAP)) {
+    if (block->flags & BLOCK_IS_MMAP) {
+        uint32_t m = load_magic(block);
+        if (m != encode_magic(block, MAGIC_ALLOC) && m != encode_magic(block, MAGIC_MMAP) && m != encode_magic(block, MAGIC_MMAP_CACHED)) abort();
+
         size_t old_usable = block->mmap_size - HEADER_SIZE;
         if (new_size <= old_usable) return ptr;
 
@@ -1725,8 +1746,10 @@ void *mbd_memalign(size_t alignment, size_t size) {
 size_t mbd_malloc_usable_size(const void *ptr) {
     if (!ptr) return 0;
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
-    if ((block->flags & BLOCK_IS_MMAP) && load_magic(block) == encode_magic(block, MAGIC_MMAP)) {
-        return block->mmap_size - HEADER_SIZE;
+    if (block->flags & BLOCK_IS_MMAP) {
+        uint32_t m = load_magic(block);
+        if (m == encode_magic(block, MAGIC_ALLOC) || m == encode_magic(block, MAGIC_MMAP) || m == encode_magic(block, MAGIC_MMAP_CACHED))
+            return block->mmap_size - HEADER_SIZE;
     }
 
     if (!is_pointer_in_any_arena(block)) return 0;
@@ -1786,6 +1809,15 @@ static void flush_my_cache(thread_cache_data_t *curr) {
     }
     if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
     curr->total_cached = 0;
+
+    // Flush mmap cache back to OS on trim
+    for (uint32_t i = 0; i < curr->mmap_cache_count; i++) {
+        block_header_t *mmap_block = curr->mmap_cache[i];
+        size_t mmap_size = mmap_block->mmap_size;
+        atomic_fetch_sub(&huge_mmap_tracked, mmap_size);
+        munmap(mmap_block, mmap_size);
+    }
+    curr->mmap_cache_count = 0;
 }
 
 /**
