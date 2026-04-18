@@ -122,8 +122,9 @@ typedef struct {
     uint32_t cache_limits[SMALL_ORDER_MAX + 1];
     /* Controls how much larger a cached mmap block can be compared to the requested size.
      * e.g., 4 means a cached block can be up to 4x the requested size.
-     * 1 means exact-fit only. 0 means disable the mmap cache entirely. */
+     * 1 means exact-fit only. 0 defaults to 4. */
     uint32_t mmap_max_waste_ratio;
+    size_t cache_pressure_threshold;
 } mbd_config_t;
 /* -- Public API -------------------------------------------------------------- */
 
@@ -852,6 +853,10 @@ static void internal_init(void) {
         global_config.mmap_max_waste_ratio = 4; // Default to 4x waste tolerance
     }
 
+    if (global_config.cache_pressure_threshold == 0) {
+        global_config.cache_pressure_threshold = MBD_CACHE_PRESSURE_THRESHOLD;
+    }
+
     // We assume limits are uninitialized only if all limits are 0.
     // If a user genuinely wants to disable the cache by setting everything to 0,
     // they can just set SMALL_ORDER_MAX to 0. Otherwise this defaults behavior.
@@ -1525,7 +1530,7 @@ void mbd_free(void *ptr) {
 
     uint32_t limit = get_cache_limit(order);
     
-    if (order <= SMALL_ORDER_MAX && data->count[order] < limit && data->total_cached < MBD_CACHE_PRESSURE_THRESHOLD) {
+    if (order <= SMALL_ORDER_MAX && data->count[order] < limit && data->total_cached < global_config.cache_pressure_threshold) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << atomic_load_explicit(&block->order, memory_order_relaxed));
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
         atomic_store_explicit(&block->flags, 0, memory_order_relaxed);
@@ -1550,7 +1555,7 @@ void mbd_free(void *ptr) {
     for (uint32_t o = MIN_ORDER; o <= SMALL_ORDER_MAX; o++) {
         if (data->count[o] == 0) continue;
         int flush_count = 0;
-        if (data->total_cached >= MBD_CACHE_PRESSURE_THRESHOLD) {
+        if (data->total_cached >= global_config.cache_pressure_threshold) {
             flush_count = data->count[o] / 2;
         } else if (o == order && data->count[o] >= limit) {
             flush_count = limit / 2;

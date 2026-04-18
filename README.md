@@ -118,6 +118,7 @@ typedef struct {
     size_t pool_size;
     uint32_t cache_limits[SMALL_ORDER_MAX + 1];
     uint32_t mmap_max_waste_ratio;
+    size_t cache_pressure_threshold;
 } mbd_config_t;
 ```
 
@@ -131,6 +132,7 @@ typedef struct {
 - **`pool_size`**: The total reservation capacity in bytes per arena.
 - **`cache_limits`**: An array dictating the maximum number of blocks a thread cache can hold for each buddy order size. Tuned to prevent thrashing. (If array is empty, defaults are applied).
 - **`mmap_max_waste_ratio`**: Controls how much larger a cached mmap block can be compared to the requested size (e.g. 4 means up to 4x). A value of 1 enforces exact-fit. A value of 0 defaults to 4.
+- **`cache_pressure_threshold`**: Controls aggressive vs. lazy flushing. When a thread's total cached bytes exceed this threshold, it triggers a bulk flush. Lower values force frequent returns to the global pool (good for memory-constrained or high thread-churn environments), while higher values allow lazy hoarding for max performance. Defaults to 4 MiB.
 
 ## API Reference
 
