@@ -6,7 +6,9 @@
  * @date April 17, 2026
  * @author Jacques Morel
  *
- * @note v1.4.8 fixes a severe performance bottleneck by removing the madvise
+ * @note v1.4.9 extends the thread cache to 1 MiB (order 20) and populates
+ *       intermediate sizes during splits to eliminate cross-order cache thrashing.
+ *       v1.4.8 fixes a severe performance bottleneck by removing the madvise
  *       cascade during coalescing. Adds mbd_release_to_os() for explicit memory release.
  *       v1.4.6 introduces granular thread cache limit configurations
  *       via `mbd_config_t` and disables `MBD_FLAG_HARDENED` by default
@@ -20,7 +22,7 @@
  * guarantees of a classic Buddy Allocator with the lock-free speed of per-thread caching.
  *
  * @section features Key Strengths
- * - **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 8 KiB in just a few CPU cycles.
+ * - **Crazy Fast**: Lock-free thread-local cache delivers allocations up to 1 MiB in just a few CPU cycles.
  * - **Fully Thread-Safe**: True per-thread caching with global locks grouped and acquired only on cache misses or large blocks.
  * - **Hardened & Safe**: Double-free protection, underflow-protected bounds checking, check-summed magic-value validation, and defused memalign exploits.
  * - **Memory Efficient**: Uses `MAP_NORESERVE` so virtual memory is only backed by physical RAM when used. High-order blocks (>2 MiB) are safely returned to the OS via `madvise` to prevent memory hoarding.
@@ -34,7 +36,7 @@
  * - **Starvation Immunity**: If a thread's native arena runs dry, it automatically migrates and binds to an arena with available memory.
  *
  * @section usage Usage Scenarios
- * - **Tiny/Medium objects** (strings, ECS entities, 4 KiB pages): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX` (defaults to 16).
+ * - **Tiny/Medium/Large objects** (strings, ECS entities, up to 1 MiB assets): Stay in the lock-free cache thanks to `SMALL_ORDER_MAX` (defaults to 20).
  * - **Large objects** (8 KiB - 128 MiB): Handled by the global buddy path (fast O(1) doubly-linked list traversal).
  * - **Massive objects** (> 128 MiB): Seamlessly routed to direct OS mmaps.
  *
