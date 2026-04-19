@@ -116,9 +116,26 @@ typedef struct {
     uint32_t flags;
     int arena_count;
     size_t pool_size;
-    uint32_t cache_limits[SMALL_ORDER_MAX + 1];
-    uint32_t mmap_max_waste_ratio;
-    size_t cache_pressure_threshold;
+
+    /* Order Limits */
+    uint32_t min_order;           // Default: 6 (64 bytes)
+    uint32_t max_order;           // Default: 27 (128 MiB)
+    uint32_t small_order_max;     // Default: 20 (1 MiB)
+    uint32_t large_cutoff_order;  // Default: 14 (16 KiB)
+
+    /* Cache Sizing & Thresholds */
+    uint32_t cache_limits[32];    // Max order is 31, so 32 slots is safe
+    uint32_t mmap_cache_slots;    // Default: 8
+    uint32_t mmap_max_waste_ratio;// Default: 4
+    size_t   cache_pressure_threshold; // Default: 4 MiB
+
+    /* Advanced Heuristics */
+    uint8_t  flush_high_watermark_pct;  // Default: 100 (Flush when 100% full)
+    uint8_t  flush_low_watermark_pct;   // Default: 50  (Flush down to 50%)
+    uint32_t refill_batch_size;         // Default: 0 (Unlimited/Fill to max)
+    uint32_t max_remote_frees_per_lock; // Default: 0 (Unlimited)
+    uint32_t migration_return_freq;     // Default: 64
+    size_t   hugepage_threshold;        // Default: 2097152 (2 MiB)
 } mbd_config_t;
 ```
 
@@ -133,6 +150,17 @@ typedef struct {
 - **`cache_limits`**: An array dictating the maximum number of blocks a thread cache can hold for each buddy order size. Tuned to prevent thrashing. (If array is empty, defaults are applied).
 - **`mmap_max_waste_ratio`**: Controls how much larger a cached mmap block can be compared to the requested size (e.g. 4 means up to 4x). A value of 1 enforces exact-fit. A value of 0 defaults to 4.
 - **`cache_pressure_threshold`**: Controls aggressive vs. lazy flushing. When a thread's total cached bytes exceed this threshold, it triggers a bulk flush. Lower values force frequent returns to the global pool (good for memory-constrained or high thread-churn environments), while higher values allow lazy hoarding for max performance. Defaults to 4 MiB.
+- **`min_order`**: The minimum allocation order size handled by the buddy allocator. Defaults to 6 (64 bytes).
+- **`max_order`**: The maximum allocation order size handled by the buddy allocator. Defaults to 27 (128 MiB).
+- **`small_order_max`**: The maximum order size handled by the lock-free thread-local cache. Defaults to 20 (1 MiB).
+- **`large_cutoff_order`**: The order size above which allocations bypass the buddy pool and use exact-fit mmap. Defaults to 14 (16 KiB).
+- **`mmap_cache_slots`**: The maximum number of slots available in the thread-local mmap cache. Defaults to 8.
+- **`flush_high_watermark_pct`**: The percentage of the cache limit at which a cache flush is triggered. Defaults to 100 (100%).
+- **`flush_low_watermark_pct`**: The percentage of the cache limit to flush down to. Defaults to 50 (50%). These two watermark parameters dictate the dynamic bulk-flushing behavior of thread caches by setting the percentage limits relative to the configured cache limits.
+- **`refill_batch_size`**: Limits the number of blocks refilled into a thread cache from an arena free list during a single lock acquisition. A value of 0 fills to the max capacity. Defaults to 0.
+- **`max_remote_frees_per_lock`**: Limits the number of blocks drained from a remote free queue into an arena free list per operation to bound lock times. A value of 0 is unlimited. Defaults to 0.
+- **`migration_return_freq`**: How frequently an allocation checks to return to a thread's home arena after it was forced to migrate to another. Defaults to 64.
+- **`hugepage_threshold`**: Allocation sizes above this threshold will attempt to use huge pages. Defaults to 2 MiB.
 
 ## API Reference
 
