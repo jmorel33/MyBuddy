@@ -1668,6 +1668,7 @@ void mbd_free(void *ptr) {
     if (atomic_load(&block_arena->active)) {
         atomic_store_explicit(&block->flags, 0, memory_order_relaxed);
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
+        MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << order);
         remote_push(block_arena, block);
     }
 }
