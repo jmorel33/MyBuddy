@@ -17,7 +17,7 @@ void *shared_pool[SHARED_POOL_SIZE];
 pthread_mutex_t pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // Global flag to stop the threads
-volatile int keep_running = 1;
+_Atomic int keep_running = 1;
 
 // Returns a random size representing thrashing behavior
 size_t rand_size() {
