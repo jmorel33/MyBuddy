@@ -112,6 +112,49 @@ void mt_small_allocs_mbd(double *time_ms) {
     *time_ms = get_time_ms() - start;
 }
 
+// Multi-thread large allocations
+void *mt_large_worker(void *arg) {
+    ThreadData *td = (ThreadData *)arg;
+    int iters = (ITERATIONS / 100) / NUM_THREADS;
+    void **ptrs = malloc(iters * sizeof(void *));
+    size_t *sizes = malloc(iters * sizeof(size_t));
+
+    unsigned int seed = (unsigned int)(uintptr_t)pthread_self();
+    for (int i = 0; i < iters; i++) {
+        sizes[i] = (rand_r(&seed) % (128 * 1024)) + 4096; // Random sizes between 4KB and ~132KB
+    }
+
+    if (td->is_mbd) {
+        for (int i = 0; i < iters; i++) ptrs[i] = mbd_alloc(sizes[i]);
+        for (int i = 0; i < iters; i++) mbd_free(ptrs[i]);
+    } else {
+        for (int i = 0; i < iters; i++) ptrs[i] = malloc(sizes[i]);
+        for (int i = 0; i < iters; i++) free(ptrs[i]);
+    }
+
+    free(ptrs);
+    free(sizes);
+    return NULL;
+}
+
+void mt_large_allocs_glibc(double *time_ms) {
+    pthread_t threads[NUM_THREADS];
+    ThreadData td = {0};
+    double start = get_time_ms();
+    for (int i = 0; i < NUM_THREADS; i++) pthread_create(&threads[i], NULL, mt_large_worker, &td);
+    for (int i = 0; i < NUM_THREADS; i++) pthread_join(threads[i], NULL);
+    *time_ms = get_time_ms() - start;
+}
+
+void mt_large_allocs_mbd(double *time_ms) {
+    pthread_t threads[NUM_THREADS];
+    ThreadData td = {1};
+    double start = get_time_ms();
+    for (int i = 0; i < NUM_THREADS; i++) pthread_create(&threads[i], NULL, mt_large_worker, &td);
+    for (int i = 0; i < NUM_THREADS; i++) pthread_join(threads[i], NULL);
+    *time_ms = get_time_ms() - start;
+}
+
 // Single-thread Mix Test
 void st_mix_glibc(double *time_ms) {
     int iters = MIX_ITERATIONS;
@@ -334,16 +377,24 @@ int main() {
     printf("    MyBuddy: %8.2f ms\n", mbd_time);
     printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
 
-    // Phase 4: Single-Thread Mix Test
-    printf("\n[4] Single-Thread Mix Test (Alloc/Free/Realloc/Calloc)\n");
+    // Phase 4: Multi-thread Large Allocations
+    printf("\n[4] Multi-Thread Large Allocs (Random 4KB-132KB, %d Threads)\n", NUM_THREADS);
+    mt_large_allocs_glibc(&glibc_time);
+    printf("    glibc:   %8.2f ms\n", glibc_time);
+    mt_large_allocs_mbd(&mbd_time);
+    printf("    MyBuddy: %8.2f ms\n", mbd_time);
+    printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
+
+    // Phase 5: Single-Thread Mix Test
+    printf("\n[5] Single-Thread Mix Test (Alloc/Free/Realloc/Calloc)\n");
     st_mix_glibc(&glibc_time);
     printf("    glibc:   %8.2f ms\n", glibc_time);
     st_mix_mbd(&mbd_time);
     printf("    MyBuddy: %8.2f ms\n", mbd_time);
     printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
 
-    // Phase 5: Multi-thread Mix Test
-    printf("\n[5] Multi-Thread Mix Test (Alloc/Free/Realloc/Calloc, %d Threads)\n", NUM_THREADS);
+    // Phase 6: Multi-thread Mix Test
+    printf("\n[6] Multi-Thread Mix Test (Alloc/Free/Realloc/Calloc, %d Threads)\n", NUM_THREADS);
     mt_mix_glibc(&glibc_time);
     printf("    glibc:   %8.2f ms\n", glibc_time);
     mt_mix_mbd(&mbd_time);
