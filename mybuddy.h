@@ -854,16 +854,16 @@ static void internal_init(void) {
     // We assume limits are uninitialized only if all limits are 0.
     // If a user genuinely wants to disable the cache by setting everything to 0,
     // they can just set SMALL_ORDER_MAX to 0. Otherwise this defaults behavior.
-    /* ── Default cache limit table (performance-oriented, user-overridable) ── */
+    /* ── Default cache limit table (aggressive on large blocks) ── */
     if (limits_uninitialized) {
         for (uint32_t order = MIN_ORDER; order <= SMALL_ORDER_MAX; order++) {
-            if (order <= 8)       global_config.cache_limits[order] = 512;
-            else if (order <= 10) global_config.cache_limits[order] = 256;
-            else if (order <= 12) global_config.cache_limits[order] = 128;
-            else if (order <= 14) global_config.cache_limits[order] = 64;   // 8-16 KiB
-            else if (order <= 16) global_config.cache_limits[order] = 16;   // 32-64 KiB   ← more aggressive
-            else if (order <= 18) global_config.cache_limits[order] = 8;    // 128-256 KiB
-            else                  global_config.cache_limits[order] = 4;    // 512 KiB–1 MiB
+            if (order <= 8)       global_config.cache_limits[order] = 512;  /* <= 256 B     */
+            else if (order <= 10) global_config.cache_limits[order] = 256;  /* <= 1 KiB     */
+            else if (order <= 12) global_config.cache_limits[order] = 128;  /* <= 4 KiB     */
+            else if (order <= 14) global_config.cache_limits[order] = 64;   /* 8-16 KiB     */
+            else if (order <= 16) global_config.cache_limits[order] = 16;   /* 32-64 KiB   ← tighter */
+            else if (order <= 18) global_config.cache_limits[order] = 8;    /* 128-256 KiB  */
+            else                  global_config.cache_limits[order] = 4;    /* 512 KiB-1 MiB */
         }
     }
     if (!(global_config.flags & MBD_FLAG_BUDDY_LARGE)) {
