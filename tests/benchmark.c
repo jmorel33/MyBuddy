@@ -23,6 +23,9 @@ double get_time_ms() {
 // Single-thread small allocations (glibc vs MyBuddy)
 void st_small_allocs_glibc(double *time_ms) {
     void **ptrs = malloc(ITERATIONS * sizeof(void *));
+    void *warmup[100];
+    for(int i=0; i<100; i++) warmup[i] = malloc(64);
+    for(int i=0; i<100; i++) free(warmup[i]);
     double start = get_time_ms();
     for (int i = 0; i < ITERATIONS; i++) ptrs[i] = malloc(64);
     for (int i = 0; i < ITERATIONS; i++) free(ptrs[i]);
@@ -32,6 +35,9 @@ void st_small_allocs_glibc(double *time_ms) {
 
 void st_small_allocs_mbd(double *time_ms) {
     void **ptrs = malloc(ITERATIONS * sizeof(void *));
+    void *warmup[100];
+    for(int i=0; i<100; i++) warmup[i] = mbd_alloc(64);
+    for(int i=0; i<100; i++) mbd_free(warmup[i]);
     double start = get_time_ms();
     for (int i = 0; i < ITERATIONS; i++) ptrs[i] = mbd_alloc(64);
     for (int i = 0; i < ITERATIONS; i++) mbd_free(ptrs[i]);
@@ -82,10 +88,17 @@ void *mt_small_worker(void *arg) {
     int iters = ITERATIONS / NUM_THREADS;
     void **ptrs = malloc(iters * sizeof(void *));
 
+    void *warmup[100];
     if (td->is_mbd) {
+        for(int i=0; i<100; i++) warmup[i] = mbd_alloc(64);
+        for(int i=0; i<100; i++) mbd_free(warmup[i]);
+
         for (int i = 0; i < iters; i++) ptrs[i] = mbd_alloc(64);
         for (int i = 0; i < iters; i++) mbd_free(ptrs[i]);
     } else {
+        for(int i=0; i<100; i++) warmup[i] = malloc(64);
+        for(int i=0; i<100; i++) free(warmup[i]);
+
         for (int i = 0; i < iters; i++) ptrs[i] = malloc(64);
         for (int i = 0; i < iters; i++) free(ptrs[i]);
     }
@@ -334,18 +347,18 @@ int main() {
     mbd_config_t bench_config = {0};
     bench_config.flags = 0; // Ensure HARDENED and ATOMIC_STATS are OFF
     bench_config.min_order = 6;
-    bench_config.small_order_max = 24; // Cache up to 16 MiB blocks!
-    bench_config.large_cutoff_order = 24;
-    bench_config.refill_batch_size = 32; // Grab 32 blocks at a time to avoid locks
-    bench_config.flush_low_watermark_pct = 20; // Keep caches very warm
-    bench_config.flush_high_watermark_pct = 95;
+    bench_config.small_order_max = 20; // Cache up to 1 MiB blocks
+    bench_config.large_cutoff_order = 20;
+    bench_config.refill_batch_size = 0; // Unlimited batch refills to avoid global lock thrashing
+    bench_config.flush_low_watermark_pct = 90; // Keep caches very warm
+    bench_config.flush_high_watermark_pct = 100;
 
     // Give massive cache limits to the thread cache to prevent global lock thrashing
-    for (int i = 0; i <= 24; i++) {
-        if (i <= 8) bench_config.cache_limits[i] = 16384;
+    for (int i = 6; i <= 20; i++) {
+        if (i <= 8)       bench_config.cache_limits[i] = 16384;
         else if (i <= 12) bench_config.cache_limits[i] = 4096;
         else if (i <= 16) bench_config.cache_limits[i] = 1024;
-        else bench_config.cache_limits[i] = 256; // Allow 1024 blocks of ANY size in the cache
+        else              bench_config.cache_limits[i] = 256;
     }
     bench_config.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
 
