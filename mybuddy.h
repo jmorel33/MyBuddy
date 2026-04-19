@@ -1540,7 +1540,7 @@ void mbd_free(void *ptr) {
 
     uint32_t limit = get_cache_limit(order);
     
-    if (order <= SMALL_ORDER_MAX && data->count[order] < limit && data->total_cached < global_config.cache_pressure_threshold) {
+    if (order <= SMALL_ORDER_MAX && data->count[order] < limit) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << atomic_load_explicit(&block->order, memory_order_relaxed));
         atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
         block->next = data->cache[order];
@@ -1568,7 +1568,7 @@ void mbd_free(void *ptr) {
             flush_count = data->count[o] / 2;
         } else if (o == order && data->count[o] >= limit) {
             flush_count = limit / 2;
-            if ((global_config.flags & MBD_FLAG_ATOMIC_STATS) && atomic_load(&data->arena->cache_pressure) > global_config.pool_size / 4) { flush_count = (limit * 3) / 4; }
+            if ((global_config.flags & MBD_FLAG_ATOMIC_STATS) && atomic_load_explicit(&data->arena->cache_pressure, memory_order_relaxed) > global_config.pool_size / 4) { flush_count = (limit * 3) / 4; }
         }
         
         while (flush_count > 0 && data->cache[o]) {
