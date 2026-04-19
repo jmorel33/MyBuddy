@@ -1332,7 +1332,9 @@ void *mbd_alloc(size_t requested_size) {
             data->total_cached -= (1ULL << order);
 
             atomic_store_explicit(&block->flags, BLOCK_USED, memory_order_relaxed);
-            atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
+            if (global_config.flags & MBD_FLAG_HARDENED) {
+                atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
+            }
             return (void *)((uint8_t*)block + HEADER_SIZE);
         }
     }
@@ -1515,7 +1517,7 @@ void mbd_free(void *ptr) {
             uint32_t limit = get_cache_limit(order);
             if (__builtin_expect(data->count[order] < limit, 1)) {
                 atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
-                atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
+                // No magic write needed if HARDENED is OFF
                 block->next = data->cache[order];
                 data->cache[order] = block;
                 data->count[order]++;
@@ -1547,12 +1549,12 @@ void mbd_free(void *ptr) {
 
     if (raw_flags & BLOCK_IS_MMAP) {
         if (!(global_config.flags & MBD_FLAG_HARDENED)) {
-            if (raw_magic != MAGIC_ALLOC && raw_magic != MAGIC_MMAP) {
+            if (raw_magic != MAGIC_ALLOC && raw_magic != MAGIC_MMAP && raw_magic != MAGIC_CACHED_MMAP) {
                 fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
                 abort();
             }
         } else {
-            if (raw_magic != encode_magic(block, MAGIC_ALLOC) && raw_magic != encode_magic(block, MAGIC_MMAP)) {
+            if (raw_magic != encode_magic(block, MAGIC_ALLOC) && raw_magic != encode_magic(block, MAGIC_MMAP) && raw_magic != encode_magic(block, MAGIC_CACHED_MMAP)) {
                 fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
                 abort();
             }
@@ -1573,18 +1575,17 @@ void mbd_free(void *ptr) {
 
     if (!(global_config.flags & MBD_FLAG_HARDENED)) {
         if (raw_flags & BLOCK_IN_CACHE) {
-            if (raw_magic != MAGIC_CACHED) abort();
             fprintf(stderr, "mbd_free: DOUBLE-FREE! Block already in thread cache. ptr=%p\n", ptr);
             abort();
         }
-        if (raw_magic != MAGIC_ALLOC) abort();
+        if (raw_magic != MAGIC_ALLOC && raw_magic != MAGIC_CACHED) abort();
     } else {
         if (raw_flags & BLOCK_IN_CACHE) {
             if (raw_magic != encode_magic(block, MAGIC_CACHED)) abort();
             fprintf(stderr, "mbd_free: DOUBLE-FREE! Block already in thread cache. ptr=%p\n", ptr);
             abort();
         }
-        if (raw_magic != encode_magic(block, MAGIC_ALLOC)) abort();
+        if (raw_magic != encode_magic(block, MAGIC_ALLOC) && raw_magic != encode_magic(block, MAGIC_CACHED)) abort();
     }
 
     mbd_arena_t *arena = block->arena;
@@ -1662,84 +1663,12 @@ void mbd_free(void *ptr) {
         return;
     }
 
-    /* Bulk flush with grouped lock acquisition to prevent thrashing */
-    if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
-        atomic_fetch_add_explicit(&data->bulk_flushes, 1, memory_order_relaxed);
-    }
-    MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, limit / 2);
-    mbd_arena_t *locked_arena = NULL;
-    
-    for (uint32_t o = global_config.min_order; o <= global_config.small_order_max; o++) {
-        if (data->count[o] == 0) continue;
-        int flush_count = 0;
-        uint32_t current_count = data->count[o];
-        uint32_t o_limit = get_cache_limit(o);
-        uint32_t high_watermark = (o_limit * global_config.flush_high_watermark_pct) / 100;
-        uint32_t low_watermark = (o_limit * global_config.flush_low_watermark_pct) / 100;
-
-        if (current_count >= high_watermark || data->total_cached >= global_config.cache_pressure_threshold) {
-            flush_count = (current_count > low_watermark) ? (int)(current_count - low_watermark) : 0;
-        }
-        
-        while (flush_count > 0 && data->cache[o]) {
-            flush_count--;
-            block_header_t *to_global = data->cache[o];
-            data->cache[o] = to_global->next;
-            data->count[o]--;
-            data->total_cached -= (1ULL << o);
-            mbd_arena_t *block_arena = to_global->arena;
-            if (locked_arena != block_arena) {
-                if (locked_arena) {
-                    pthread_mutex_unlock(&locked_arena->lock);
-                }
-                locked_arena = block_arena;
-                pthread_mutex_lock(&locked_arena->lock);
-                drain_remote_queue(locked_arena);
-            }
-
-            atomic_store_explicit(&to_global->flags, 0, memory_order_relaxed);
-            atomic_store_explicit(&to_global->magic, encode_magic(to_global, MAGIC_FREE), memory_order_release);
-
-            uint32_t original_order = atomic_load_explicit(&to_global->order, memory_order_relaxed);
-            uint32_t coalesced_order = original_order;
-            to_global = coalesce_up_and_update(locked_arena, to_global, &coalesced_order);
-            arena_insert(locked_arena, coalesced_order, to_global);
-            if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
-                atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
-                atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
-            }
-        }
-    } // End of o loop
-    
-    /* Add the target block to the now-emptied cache */
-    if (data->count[order] < limit) {
-        if (locked_arena) {
-            pthread_mutex_unlock(&locked_arena->lock);
-        }
-        atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
-        atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
-        block->next = data->cache[order];
-        data->cache[order] = block;
-        data->count[order]++;
-        data->total_cached += (1ULL << order);
-        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
-            atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-            atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
-        }
-    } else {
-        mbd_arena_t *block_arena = block->arena;
-        if (locked_arena != block_arena) {
-            if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
-            locked_arena = block_arena;
-            pthread_mutex_lock(&locked_arena->lock);
-            drain_remote_queue(locked_arena);
-        }
+    /* Cache full: push to remote free queue (Lock-free!) */
+    mbd_arena_t *block_arena = block->arena;
+    if (atomic_load(&block_arena->active)) {
         atomic_store_explicit(&block->flags, 0, memory_order_relaxed);
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
-        uint32_t coalesced_order = order;
-        block = coalesce_up_and_update(locked_arena, block, &coalesced_order);
-        arena_insert(locked_arena, coalesced_order, block);
-        if (locked_arena) pthread_mutex_unlock(&locked_arena->lock);
+        remote_push(block_arena, block);
     }
 }
 
@@ -1780,7 +1709,11 @@ void *mbd_realloc(void *ptr, size_t new_size) {
 
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
-        if (m != encode_magic(block, MAGIC_ALLOC) && m != encode_magic(block, MAGIC_MMAP)) abort();
+        if (!(global_config.flags & MBD_FLAG_HARDENED)) {
+            if (m != MAGIC_ALLOC && m != MAGIC_MMAP && m != MAGIC_CACHED_MMAP) abort();
+        } else {
+            if (m != encode_magic(block, MAGIC_ALLOC) && m != encode_magic(block, MAGIC_MMAP) && m != encode_magic(block, MAGIC_CACHED_MMAP)) abort();
+        }
 
         size_t old_usable = block->mmap_size - HEADER_SIZE;
         if (new_size <= old_usable) return ptr;
@@ -1792,7 +1725,11 @@ void *mbd_realloc(void *ptr, size_t new_size) {
         return new_ptr;
     }
 
-    if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) abort();
+    if (!(global_config.flags & MBD_FLAG_HARDENED)) {
+        if (load_magic(block) != MAGIC_ALLOC && load_magic(block) != MAGIC_CACHED) abort();
+    } else {
+        if (load_magic(block) != encode_magic(block, MAGIC_ALLOC) && load_magic(block) != encode_magic(block, MAGIC_CACHED)) abort();
+    }
 
     size_t old_usable = ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
     if (new_size <= old_usable) {
@@ -1911,8 +1848,13 @@ size_t mbd_malloc_usable_size(const void *ptr) {
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
     if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
         uint32_t m = load_magic(block);
-        if (m == encode_magic(block, MAGIC_ALLOC) || m == encode_magic(block, MAGIC_MMAP))
-            return block->mmap_size - HEADER_SIZE;
+        if (!(global_config.flags & MBD_FLAG_HARDENED)) {
+            if (m == MAGIC_ALLOC || m == MAGIC_MMAP || m == MAGIC_CACHED_MMAP)
+                return block->mmap_size - HEADER_SIZE;
+        } else {
+            if (m == encode_magic(block, MAGIC_ALLOC) || m == encode_magic(block, MAGIC_MMAP) || m == encode_magic(block, MAGIC_CACHED_MMAP))
+                return block->mmap_size - HEADER_SIZE;
+        }
     }
 
     mbd_arena_t *arena = block->arena;
@@ -1930,7 +1872,11 @@ size_t mbd_malloc_usable_size(const void *ptr) {
         return old_usable > offset ? old_usable - offset : 0;
     }
 
-    if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) return 0;
+    if (!(global_config.flags & MBD_FLAG_HARDENED)) {
+        if (load_magic(block) != MAGIC_ALLOC && load_magic(block) != MAGIC_CACHED) return 0;
+    } else {
+        if (load_magic(block) != encode_magic(block, MAGIC_ALLOC) && load_magic(block) != encode_magic(block, MAGIC_CACHED)) return 0;
+    }
     return ((size_t)1 << atomic_load_explicit(&block->order, memory_order_relaxed)) - HEADER_SIZE;
 }
 
