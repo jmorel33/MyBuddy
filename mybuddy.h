@@ -1323,7 +1323,7 @@ void *mbd_alloc(size_t requested_size) {
 
     /* HOT PATH -- Zero branches, zero atomic loads (besides the block flags) */
     if (__builtin_expect(data && order <= global_config.small_order_max && data->cache[order], 1)) {
-        if (__builtin_expect(atomic_load(&trim_requested) != data->last_trim_request, 0)) {
+        if (__builtin_expect(atomic_load_explicit(&trim_requested, memory_order_relaxed) != data->last_trim_request, 0)) {
             // Fall through to slow path which handles the trim
         } else {
             block_header_t *block = data->cache[order];
@@ -1517,12 +1517,22 @@ void mbd_free(void *ptr) {
             uint32_t limit = get_cache_limit(order);
             if (__builtin_expect(data->count[order] < limit, 1)) {
                 atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
-                // No magic write needed if HARDENED is OFF
+                // No magic write needed if HARDENED is OFF!
                 block->next = data->cache[order];
                 data->cache[order] = block;
                 data->count[order]++;
                 data->total_cached += (1ULL << order);
                 return;
+            } else {
+                // CACHE FULL! Push directly to remote queue (Lock-free) to avoid slow path!
+                mbd_arena_t *block_arena = block->arena;
+                if (atomic_load_explicit(&block_arena->active, memory_order_relaxed)) {
+                    atomic_store_explicit(&block->flags, 0, memory_order_relaxed);
+                    atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
+                    MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << order);
+                    remote_push(block_arena, block);
+                }
+                return; // DO NOT fall through!
             }
         }
     }
