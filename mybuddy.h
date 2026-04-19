@@ -114,6 +114,7 @@ extern "C" {
 #define BLOCK_IS_MMAP        (1u << 1)
 #define BLOCK_IN_FREE_LIST   (1u << 2)
 #define BLOCK_FRESH          (1u << 3)
+#define BLOCK_IN_CACHE       (1u << 4)
 
 typedef struct {
     uint32_t flags;
@@ -1106,7 +1107,8 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
 
                 /* If the buddy is cacheable, put it directly in the thread cache! */
                 if (new_order <= SMALL_ORDER_MAX && data->count[new_order] < get_cache_limit(new_order)) {
-                    atomic_store_explicit(&buddy->magic, encode_magic(buddy, MAGIC_CACHED), memory_order_release);
+                    atomic_store_explicit(&buddy->flags, BLOCK_IN_CACHE, memory_order_relaxed);
+                    atomic_store_explicit(&buddy->magic, encode_magic(buddy, MAGIC_ALLOC), memory_order_release);
                     buddy->next = data->cache[new_order];
                     data->cache[new_order] = buddy;
                     data->count[new_order]++;
@@ -1132,7 +1134,8 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
             arena_remove(locked_arena, block, order);
         }
 
-        atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
+        atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
+        atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
         block->arena = locked_arena;
         block->next = data->cache[order];
         data->cache[order] = block;
@@ -1432,42 +1435,63 @@ void *mbd_alloc(size_t requested_size) {
  */
 void mbd_free(void *ptr) {
     if (!ptr) return;
-    if (atomic_load(&fully_destroyed)) return;   // prevent use-after-destroy
+    if (atomic_load_explicit(&fully_destroyed, memory_order_relaxed)) return;
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
-    if (load_magic(block) == encode_magic(block, MAGIC_MEMALIGN)) {
-        void *raw = block->prev;
-        atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release); /* Defuse double-free vulnerability, but keep it MAGIC_FREE to fail consistently */
-        mbd_free(raw);
-        return;
+
+    uint32_t raw_magic = load_magic(block);
+    uint8_t  raw_flags = atomic_load_explicit(&block->flags, memory_order_relaxed);
+
+    if (!(global_config.flags & MBD_FLAG_HARDENED)) {
+        if (raw_magic == MAGIC_MEMALIGN) {
+            void *raw = block->prev;
+            atomic_store_explicit(&block->magic, MAGIC_FREE, memory_order_release);
+            mbd_free(raw);
+            return;
+        }
+    } else {
+        if (raw_magic == encode_magic(block, MAGIC_MEMALIGN)) {
+            void *raw = block->prev;
+            atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
+            mbd_free(raw);
+            return;
+        }
     }
 
-    if (atomic_load_explicit(&block->flags, memory_order_relaxed) & BLOCK_IS_MMAP) {
-        uint32_t m = load_magic(block);
-        if (m != encode_magic(block, MAGIC_ALLOC) &&
-            m != encode_magic(block, MAGIC_MMAP)) {
-            fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
-            abort();
+    if (raw_flags & BLOCK_IS_MMAP) {
+        if (!(global_config.flags & MBD_FLAG_HARDENED)) {
+            if (raw_magic != MAGIC_ALLOC && raw_magic != MAGIC_MMAP) {
+                fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
+                abort();
+            }
+        } else {
+            if (raw_magic != encode_magic(block, MAGIC_ALLOC) && raw_magic != encode_magic(block, MAGIC_MMAP)) {
+                fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption of mmap block! ptr=%p\n", ptr);
+                abort();
+            }
         }
 
-        thread_cache_data_t *data = atomic_load(&fully_destroyed) ? NULL : pthread_getspecific(thread_cache_key);
-        // Push to thread-local mmap cache to avoid munmap syscall!
+        thread_cache_data_t *data = atomic_load_explicit(&fully_destroyed, memory_order_relaxed) ? NULL : pthread_getspecific(thread_cache_key);
         if (data && data->mmap_cache_count < 8) {
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED_MMAP), memory_order_release);
             data->mmap_cache[data->mmap_cache_count++] = block;
             return;
         }
-        // Transition to free to prevent caching double frees natively
         atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_FREE), memory_order_release);
-        // Cache full, return to OS
         size_t mmap_size = block->mmap_size;
         atomic_fetch_sub(&huge_mmap_tracked, mmap_size);
         munmap(block, mmap_size);
         return;
     }
 
-    if (load_magic(block) != encode_magic(block, MAGIC_ALLOC)) {
-        // fprintf(stderr, "mbd_free: DOUBLE-FREE or corruption! ptr=%p block=%p magic=%x alloc=%x cached=%x free=%x\n", ptr, block, load_magic(block), encode_magic(block, MAGIC_ALLOC), encode_magic(block, MAGIC_CACHED), encode_magic(block, MAGIC_FREE));
+    if (raw_flags & BLOCK_IN_CACHE) {
+        fprintf(stderr, "mbd_free: DOUBLE-FREE! Block already in thread cache. ptr=%p\n", ptr);
         abort();
+    }
+
+    if (!(global_config.flags & MBD_FLAG_HARDENED)) {
+        if (raw_magic != MAGIC_ALLOC) abort();
+    } else {
+        if (raw_magic != encode_magic(block, MAGIC_ALLOC)) abort();
     }
 
     mbd_arena_t *arena = block->arena;
