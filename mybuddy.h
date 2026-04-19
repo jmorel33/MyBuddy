@@ -1321,8 +1321,7 @@ void *mbd_alloc(size_t requested_size) {
             atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
             atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
         }
-    atomic_store_explicit(&block->flags, BLOCK_USED, memory_order_relaxed);
-        atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
+        atomic_store_explicit(&block->flags, BLOCK_USED, memory_order_relaxed);
         if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
             atomic_fetch_add_explicit(&data->cache_hits, 1, memory_order_relaxed);
         }
@@ -1351,7 +1350,6 @@ void *mbd_alloc(size_t requested_size) {
                 atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
             }
             atomic_store_explicit(&block->flags, BLOCK_USED, memory_order_relaxed);
-            atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
             pthread_mutex_unlock(&arena->lock);
             void *res = (void *)((uint8_t*)block + HEADER_SIZE);
             MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
@@ -1556,8 +1554,7 @@ void mbd_free(void *ptr) {
     
     if (order <= SMALL_ORDER_MAX && data->count[order] < limit && data->total_cached < global_config.cache_pressure_threshold) {
         MBD_FIRE_EVENT(MBD_EVENT_FREE, ptr, 1ULL << atomic_load_explicit(&block->order, memory_order_relaxed));
-        atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
-        atomic_store_explicit(&block->flags, 0, memory_order_relaxed);
+        atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
         block->next = data->cache[order];
         data->cache[order] = block;
         data->count[order]++;
@@ -1621,8 +1618,7 @@ void mbd_free(void *ptr) {
     }
 
     /* Add the target block to the now-emptied cache */
-    atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_CACHED), memory_order_release);
-    atomic_store_explicit(&block->flags, 0, memory_order_relaxed);
+    atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
     block->next = data->cache[order];
     data->cache[order] = block;
     data->count[order]++;
