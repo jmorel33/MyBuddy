@@ -205,7 +205,14 @@ int main() {
     printf("Max Mix Size: %d\n", MAX_MIX_SIZE);
     printf("=========================================\n");
 
-        mbd_config_t cfg = {0};
+    mbd_config_t cfg = {0};
+    cfg.flags = 0; // Ensure HARDENED and ATOMIC_STATS are OFF
+    cfg.min_order = 6;
+    cfg.small_order_max = 24; // Cache up to 16 MiB blocks!
+    cfg.large_cutoff_order = 24;
+    cfg.refill_batch_size = 32; // Grab 32 blocks at a time to avoid locks
+    cfg.flush_low_watermark_pct = 20; // Keep caches very warm
+    cfg.flush_high_watermark_pct = 95;
     cfg.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
     mbd_init(&cfg);
 
