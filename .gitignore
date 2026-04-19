@@ -7,3 +7,10 @@ tests/test_huge
 tests/test_string_view
 tests/test_usable_size
 tests/benchmark
+tests/test_basic_asan
+tests/test_brutal
+tests/test_brutal_tsan
+tests/test_multithread_stress
+tests/test_multithread_stress_dbg
+tests/test_multithread_stress_tsan
+tests/test_threads_tsan
