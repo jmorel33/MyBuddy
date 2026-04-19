@@ -299,7 +299,10 @@ int main() {
 
     // Give massive cache limits to the thread cache to prevent global lock thrashing
     for (int i = 0; i <= 24; i++) {
-        bench_config.cache_limits[i] = 1024; // Allow 1024 blocks of ANY size in the cache
+        if (i <= 8) bench_config.cache_limits[i] = 16384;
+        else if (i <= 12) bench_config.cache_limits[i] = 4096;
+        else if (i <= 16) bench_config.cache_limits[i] = 1024;
+        else bench_config.cache_limits[i] = 256; // Allow 1024 blocks of ANY size in the cache
     }
     bench_config.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
 
