@@ -112,6 +112,89 @@ void mt_small_allocs_mbd(double *time_ms) {
     *time_ms = get_time_ms() - start;
 }
 
+// Single-thread Mix Test
+void st_mix_glibc(double *time_ms) {
+    int iters = MIX_ITERATIONS;
+    void **ptrs = malloc(iters * sizeof(void *));
+    size_t *sizes = malloc(iters * sizeof(size_t));
+    int *actions = malloc(iters * sizeof(int));
+
+    unsigned int seed = 42;
+    for (int i = 0; i < iters; i++) {
+        sizes[i] = (rand_r(&seed) % MAX_MIX_SIZE) + 1;
+        actions[i] = rand_r(&seed) % 100;
+        ptrs[i] = NULL;
+    }
+
+    double start = get_time_ms();
+    for (int i = 0; i < iters; i++) {
+        if (actions[i] < 45) { // Alloc
+            ptrs[i] = malloc(sizes[i]);
+        } else if (actions[i] < 90) { // Free
+            int target = rand_r(&seed) % (i + 1);
+            if (ptrs[target]) {
+                free(ptrs[target]);
+                ptrs[target] = NULL;
+            }
+        } else if (actions[i] < 95) { // Realloc
+            int target = rand_r(&seed) % (i + 1);
+            size_t new_size = (rand_r(&seed) % MAX_MIX_SIZE) + 1;
+            ptrs[target] = realloc(ptrs[target], new_size);
+        } else { // Calloc
+            ptrs[i] = calloc(1, sizes[i]);
+        }
+    }
+    for (int i = 0; i < iters; i++) {
+        if (ptrs[i]) free(ptrs[i]);
+    }
+    *time_ms = get_time_ms() - start;
+
+    free(ptrs);
+    free(sizes);
+    free(actions);
+}
+
+void st_mix_mbd(double *time_ms) {
+    int iters = MIX_ITERATIONS;
+    void **ptrs = malloc(iters * sizeof(void *));
+    size_t *sizes = malloc(iters * sizeof(size_t));
+    int *actions = malloc(iters * sizeof(int));
+
+    unsigned int seed = 42;
+    for (int i = 0; i < iters; i++) {
+        sizes[i] = (rand_r(&seed) % MAX_MIX_SIZE) + 1;
+        actions[i] = rand_r(&seed) % 100;
+        ptrs[i] = NULL;
+    }
+
+    double start = get_time_ms();
+    for (int i = 0; i < iters; i++) {
+        if (actions[i] < 45) { // Alloc
+            ptrs[i] = mbd_alloc(sizes[i]);
+        } else if (actions[i] < 90) { // Free
+            int target = rand_r(&seed) % (i + 1);
+            if (ptrs[target]) {
+                mbd_free(ptrs[target]);
+                ptrs[target] = NULL;
+            }
+        } else if (actions[i] < 95) { // Realloc
+            int target = rand_r(&seed) % (i + 1);
+            size_t new_size = (rand_r(&seed) % MAX_MIX_SIZE) + 1;
+            ptrs[target] = mbd_realloc(ptrs[target], new_size);
+        } else { // Calloc
+            ptrs[i] = mbd_calloc(1, sizes[i]);
+        }
+    }
+    for (int i = 0; i < iters; i++) {
+        if (ptrs[i]) mbd_free(ptrs[i]);
+    }
+    *time_ms = get_time_ms() - start;
+
+    free(ptrs);
+    free(sizes);
+    free(actions);
+}
+
 // Multi-thread Mix test
 void *mt_mix_worker(void *arg) {
     ThreadData *td = (ThreadData *)arg;
@@ -205,16 +288,25 @@ int main() {
     printf("Max Mix Size: %d\n", MAX_MIX_SIZE);
     printf("=========================================\n");
 
-    mbd_config_t cfg = {0};
-    cfg.flags = 0; // Ensure HARDENED and ATOMIC_STATS are OFF
-    cfg.min_order = 6;
-    cfg.small_order_max = 24; // Cache up to 16 MiB blocks!
-    cfg.large_cutoff_order = 24;
-    cfg.refill_batch_size = 32; // Grab 32 blocks at a time to avoid locks
-    cfg.flush_low_watermark_pct = 20; // Keep caches very warm
-    cfg.flush_high_watermark_pct = 95;
-    cfg.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
-    mbd_init(&cfg);
+    mbd_config_t bench_config = {0};
+    bench_config.flags = 0; // Ensure HARDENED and ATOMIC_STATS are OFF
+    bench_config.min_order = 6;
+    bench_config.small_order_max = 24; // Cache up to 16 MiB blocks!
+    bench_config.large_cutoff_order = 24;
+    bench_config.refill_batch_size = 32; // Grab 32 blocks at a time to avoid locks
+    bench_config.flush_low_watermark_pct = 20; // Keep caches very warm
+    bench_config.flush_high_watermark_pct = 95;
+
+    // Give massive cache limits to the thread cache to prevent global lock thrashing
+    for (int i = 0; i <= 24; i++) {
+        if (i <= 8) bench_config.cache_limits[i] = 16384;
+        else if (i <= 12) bench_config.cache_limits[i] = 4096;
+        else if (i <= 16) bench_config.cache_limits[i] = 1024;
+        else bench_config.cache_limits[i] = 256; // Allow 1024 blocks of ANY size in the cache
+    }
+    bench_config.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
+
+    mbd_init(&bench_config);
 
     double glibc_time, mbd_time;
 
@@ -242,8 +334,16 @@ int main() {
     printf("    MyBuddy: %8.2f ms\n", mbd_time);
     printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
 
-    // Phase 4: Multi-thread Mix Test
-    printf("\n[4] Multi-Thread Mix Test (Alloc/Free/Realloc/Calloc, %d Threads)\n", NUM_THREADS);
+    // Phase 4: Single-Thread Mix Test
+    printf("\n[4] Single-Thread Mix Test (Alloc/Free/Realloc/Calloc)\n");
+    st_mix_glibc(&glibc_time);
+    printf("    glibc:   %8.2f ms\n", glibc_time);
+    st_mix_mbd(&mbd_time);
+    printf("    MyBuddy: %8.2f ms\n", mbd_time);
+    printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
+
+    // Phase 5: Multi-thread Mix Test
+    printf("\n[5] Multi-Thread Mix Test (Alloc/Free/Realloc/Calloc, %d Threads)\n", NUM_THREADS);
     mt_mix_glibc(&glibc_time);
     printf("    glibc:   %8.2f ms\n", glibc_time);
     mt_mix_mbd(&mbd_time);
@@ -252,7 +352,7 @@ int main() {
     printf("    Speedup: %8.2fx\n", mix_speedup);
 
     printf("\n=========================================\n");
-    printf("FINAL SCORE (Mix Test Speedup): %.2fx\n", mix_speedup);
+    printf("FINAL SCORE (MT Mix Test Speedup): %.2fx\n", mix_speedup);
     printf("=========================================\n");
 
     mbd_destroy();

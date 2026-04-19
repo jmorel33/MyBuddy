@@ -1003,8 +1003,6 @@ static void flush_my_cache(thread_cache_data_t *curr);
 
 __attribute__((noinline, cold))
 static thread_cache_data_t *get_thread_cache_slow(void) {
-    if (atomic_load(&fully_destroyed)) return NULL;
-
     pthread_once(&init_once, internal_init);
 
     thread_cache_data_t *data = pthread_getspecific(thread_cache_key);
@@ -1307,12 +1305,25 @@ void *mbd_alloc(size_t requested_size) {
 
     uint32_t order = next_power_of_two_order(needed);
 
-    /* If the block is too large for the buddy system, OR 
-       the buddy large flag is off and we exceed the cutoff, use mmap cache/syscall. */
-    if (needed > global_config.pool_size || 
+    thread_cache_data_t *data = local_thread_cache;
+
+    /* HOT PATH -- Zero branches, zero atomic loads (besides the block flags) */
+    if (__builtin_expect(data && order <= global_config.small_order_max && data->cache[order], 1)) {
+        block_header_t *block = data->cache[order];
+        data->cache[order] = block->next;
+        data->count[order]--;
+        data->total_cached -= (1ULL << order);
+
+        atomic_store_explicit(&block->flags, BLOCK_USED, memory_order_relaxed);
+        return (void *)((uint8_t*)block + HEADER_SIZE);
+    }
+
+    /* SLOW PATH STARTS HERE */
+    if (needed > global_config.pool_size ||
         (!(global_config.flags & MBD_FLAG_BUDDY_LARGE) && order > global_config.large_cutoff_order)) {
         
-        thread_cache_data_t *data = atomic_load(&fully_destroyed) ? NULL : pthread_getspecific(thread_cache_key);
+        // Re-read data if necessary, or just use what we have (slow path)
+        data = pthread_getspecific(thread_cache_key);
         
         // Check thread-local mmap cache first to avoid syscalls!
         if (data) {
@@ -1362,33 +1373,13 @@ void *mbd_alloc(size_t requested_size) {
         return res;
     }
 
-    thread_cache_data_t *data = get_thread_cache_fast();
+    data = get_thread_cache_fast();
     if (!data) { handle_oom(); return NULL; }
     if (__builtin_expect(atomic_load(&trim_requested) != data->last_trim_request, 0)) {
         flush_my_cache(data);
         data->last_trim_request = atomic_load(&trim_requested);
     }
     mbd_arena_t *arena = atomic_load_explicit(&data->arena, memory_order_relaxed);
-
-    /* HOT PATH -- lock-free */
-    if (order <= global_config.small_order_max && data->cache[order]) {
-        block_header_t *block = data->cache[order];
-        data->cache[order] = block->next;
-        data->count[order]--;
-        data->total_cached -= (1ULL << order);
-        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
-            atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-            atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
-        }
-        atomic_store_explicit(&block->flags, BLOCK_USED, memory_order_relaxed);
-        if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
-            atomic_fetch_add_explicit(&data->cache_hits, 1, memory_order_relaxed);
-        }
-        // Notice: We intentionally do NOT overwrite block->arena.
-        void *res = (void *)((uint8_t*)block + HEADER_SIZE);
-        MBD_FIRE_EVENT(MBD_EVENT_ALLOC, res, requested_size);
-        return res;
-    }
 
     pthread_mutex_lock(&arena->lock);
     drain_remote_queue(arena);
@@ -1490,12 +1481,32 @@ void *mbd_alloc(size_t requested_size) {
  * @param ptr Pointer to the memory to free (can be NULL).
  */
 void mbd_free(void *ptr) {
-    if (!ptr) return;
-    if (atomic_load_explicit(&fully_destroyed, memory_order_relaxed)) return;
+    if (__builtin_expect(!ptr, 0)) return;
     block_header_t *block = (block_header_t *)((uint8_t*)ptr - HEADER_SIZE);
 
+    uint8_t raw_flags = atomic_load_explicit(&block->flags, memory_order_relaxed);
+
+    /* FAST PATH: Standard block, Hardening OFF */
+    if (__builtin_expect(raw_flags == BLOCK_USED && !(global_config.flags & MBD_FLAG_HARDENED), 1)) {
+        uint32_t order = atomic_load_explicit(&block->order, memory_order_relaxed);
+        thread_cache_data_t *data = local_thread_cache;
+
+        if (__builtin_expect(data && order <= global_config.small_order_max, 1)) {
+            uint32_t limit = get_cache_limit(order);
+            if (__builtin_expect(data->count[order] < limit, 1)) {
+                atomic_store_explicit(&block->flags, BLOCK_IN_CACHE, memory_order_relaxed);
+                block->next = data->cache[order];
+                data->cache[order] = block;
+                data->count[order]++;
+                data->total_cached += (1ULL << order);
+                return;
+            }
+        }
+    }
+
+    /* SLOW PATH / HARDENED PATH STARTS HERE */
+    if (atomic_load_explicit(&fully_destroyed, memory_order_relaxed)) return;
     uint32_t raw_magic = load_magic(block);
-    uint8_t  raw_flags = atomic_load_explicit(&block->flags, memory_order_relaxed);
 
     if (!(global_config.flags & MBD_FLAG_HARDENED)) {
         if (raw_magic == MAGIC_MEMALIGN) {
