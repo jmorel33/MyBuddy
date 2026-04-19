@@ -378,6 +378,7 @@ static inline long mbd_sysconf(int name) {
 #endif
 #include <unistd.h>
 #include <sys/syscall.h>
+#include <sched.h>
 #endif
 #include <stdatomic.h>
 #include <assert.h>
@@ -1639,8 +1640,7 @@ void mbd_free(void *ptr) {
         uint32_t low_watermark = (o_limit * global_config.flush_low_watermark_pct) / 100;
 
         if (current_count >= high_watermark || data->total_cached >= global_config.cache_pressure_threshold) {
-            flush_count = current_count - low_watermark;
-            if (flush_count < 0) flush_count = 0;
+            flush_count = (current_count > low_watermark) ? (int)(current_count - low_watermark) : 0;
         }
         
         while (flush_count > 0 && data->cache[o]) {
