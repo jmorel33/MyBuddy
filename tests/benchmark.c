@@ -23,9 +23,6 @@ double get_time_ms() {
 // Single-thread small allocations (glibc vs MyBuddy)
 void st_small_allocs_glibc(double *time_ms) {
     void **ptrs = malloc(ITERATIONS * sizeof(void *));
-    void *warmup[100];
-    for(int i=0; i<100; i++) warmup[i] = malloc(64);
-    for(int i=0; i<100; i++) free(warmup[i]);
     double start = get_time_ms();
     for (int i = 0; i < ITERATIONS; i++) ptrs[i] = malloc(64);
     for (int i = 0; i < ITERATIONS; i++) free(ptrs[i]);
@@ -35,9 +32,6 @@ void st_small_allocs_glibc(double *time_ms) {
 
 void st_small_allocs_mbd(double *time_ms) {
     void **ptrs = malloc(ITERATIONS * sizeof(void *));
-    void *warmup[100];
-    for(int i=0; i<100; i++) warmup[i] = mbd_alloc(64);
-    for(int i=0; i<100; i++) mbd_free(warmup[i]);
     double start = get_time_ms();
     for (int i = 0; i < ITERATIONS; i++) ptrs[i] = mbd_alloc(64);
     for (int i = 0; i < ITERATIONS; i++) mbd_free(ptrs[i]);
@@ -88,17 +82,10 @@ void *mt_small_worker(void *arg) {
     int iters = ITERATIONS / NUM_THREADS;
     void **ptrs = malloc(iters * sizeof(void *));
 
-    void *warmup[100];
     if (td->is_mbd) {
-        for(int i=0; i<100; i++) warmup[i] = mbd_alloc(64);
-        for(int i=0; i<100; i++) mbd_free(warmup[i]);
-        
         for (int i = 0; i < iters; i++) ptrs[i] = mbd_alloc(64);
         for (int i = 0; i < iters; i++) mbd_free(ptrs[i]);
     } else {
-        for(int i=0; i<100; i++) warmup[i] = malloc(64);
-        for(int i=0; i<100; i++) free(warmup[i]);
-        
         for (int i = 0; i < iters; i++) ptrs[i] = malloc(64);
         for (int i = 0; i < iters; i++) free(ptrs[i]);
     }
@@ -121,49 +108,6 @@ void mt_small_allocs_mbd(double *time_ms) {
     ThreadData td = {1};
     double start = get_time_ms();
     for (int i = 0; i < NUM_THREADS; i++) pthread_create(&threads[i], NULL, mt_small_worker, &td);
-    for (int i = 0; i < NUM_THREADS; i++) pthread_join(threads[i], NULL);
-    *time_ms = get_time_ms() - start;
-}
-
-// Multi-thread large allocations
-void *mt_large_worker(void *arg) {
-    ThreadData *td = (ThreadData *)arg;
-    int iters = (ITERATIONS / 100) / NUM_THREADS;
-    void **ptrs = malloc(iters * sizeof(void *));
-    size_t *sizes = malloc(iters * sizeof(size_t));
-    
-    unsigned int seed = (unsigned int)(uintptr_t)pthread_self();
-    for (int i = 0; i < iters; i++) {
-        sizes[i] = (rand_r(&seed) % (128 * 1024)) + 4096; // Random sizes between 4KB and ~132KB
-    }
-
-    if (td->is_mbd) {
-        for (int i = 0; i < iters; i++) ptrs[i] = mbd_alloc(sizes[i]);
-        for (int i = 0; i < iters; i++) mbd_free(ptrs[i]);
-    } else {
-        for (int i = 0; i < iters; i++) ptrs[i] = malloc(sizes[i]);
-        for (int i = 0; i < iters; i++) free(ptrs[i]);
-    }
-
-    free(ptrs);
-    free(sizes);
-    return NULL;
-}
-
-void mt_large_allocs_glibc(double *time_ms) {
-    pthread_t threads[NUM_THREADS];
-    ThreadData td = {0};
-    double start = get_time_ms();
-    for (int i = 0; i < NUM_THREADS; i++) pthread_create(&threads[i], NULL, mt_large_worker, &td);
-    for (int i = 0; i < NUM_THREADS; i++) pthread_join(threads[i], NULL);
-    *time_ms = get_time_ms() - start;
-}
-
-void mt_large_allocs_mbd(double *time_ms) {
-    pthread_t threads[NUM_THREADS];
-    ThreadData td = {1};
-    double start = get_time_ms();
-    for (int i = 0; i < NUM_THREADS; i++) pthread_create(&threads[i], NULL, mt_large_worker, &td);
     for (int i = 0; i < NUM_THREADS; i++) pthread_join(threads[i], NULL);
     *time_ms = get_time_ms() - start;
 }
@@ -345,22 +289,20 @@ int main() {
     printf("=========================================\n");
 
     mbd_config_t bench_config = {0};
-    bench_config.flags = MBD_FLAG_BUDDY_LARGE; // CRITICAL: Use buddy for large blocks, not mmap!
+    bench_config.flags = 0; // Ensure HARDENED and ATOMIC_STATS are OFF
     bench_config.min_order = 6;
-    bench_config.small_order_max = 20;
-    bench_config.large_cutoff_order = 20;
-    bench_config.refill_batch_size = 0;    // CRITICAL: Unlimited batch refills
-    bench_config.mmap_cache_slots = 64;    // Cache mmap fallbacks heavily
-    bench_config.mmap_max_waste_ratio = 4;
-    bench_config.flush_high_watermark_pct = 100; // Only flush if 100% full
-    bench_config.flush_low_watermark_pct = 90;   // And only flush 10%
+    bench_config.small_order_max = 24; // Cache up to 16 MiB blocks!
+    bench_config.large_cutoff_order = 24;
+    bench_config.refill_batch_size = 32; // Grab 32 blocks at a time to avoid locks
+    bench_config.flush_low_watermark_pct = 20; // Keep caches very warm
+    bench_config.flush_high_watermark_pct = 95;
 
     // Give massive cache limits to the thread cache to prevent global lock thrashing
-    for (int i = 6; i <= 20; i++) {
-        if (i <= 8)       bench_config.cache_limits[i] = 16384;
+    for (int i = 0; i <= 24; i++) {
+        if (i <= 8) bench_config.cache_limits[i] = 16384;
         else if (i <= 12) bench_config.cache_limits[i] = 4096;
         else if (i <= 16) bench_config.cache_limits[i] = 1024;
-        else              bench_config.cache_limits[i] = 256;
+        else bench_config.cache_limits[i] = 256; // Allow 1024 blocks of ANY size in the cache
     }
     bench_config.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
 
@@ -384,32 +326,24 @@ int main() {
     printf("    MyBuddy: %8.2f ms\n", mbd_time);
     printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
 
-    // Phase 3: Single-Thread Mix Test
-    printf("\n[3] Single-Thread Mix Test (Alloc/Free/Realloc/Calloc)\n");
-    st_mix_glibc(&glibc_time);
-    printf("    glibc:   %8.2f ms\n", glibc_time);
-    st_mix_mbd(&mbd_time);
-    printf("    MyBuddy: %8.2f ms\n", mbd_time);
-    printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
-
-    // Phase 4: Multi-thread Small Allocations
-    printf("\n[4] Multi-Thread Small Allocs (64B, %d Threads)\n", NUM_THREADS);
+    // Phase 3: Multi-thread Small Allocations
+    printf("\n[3] Multi-Thread Small Allocs (64B, %d Threads)\n", NUM_THREADS);
     mt_small_allocs_glibc(&glibc_time);
     printf("    glibc:   %8.2f ms\n", glibc_time);
     mt_small_allocs_mbd(&mbd_time);
     printf("    MyBuddy: %8.2f ms\n", mbd_time);
     printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
 
-    // Phase 5: Multi-thread Large Allocations
-    printf("\n[5] Multi-Thread Large Allocs (Random 4KB-132KB, %d Threads)\n", NUM_THREADS);
-    mt_large_allocs_glibc(&glibc_time);
+    // Phase 4: Single-Thread Mix Test
+    printf("\n[4] Single-Thread Mix Test (Alloc/Free/Realloc/Calloc)\n");
+    st_mix_glibc(&glibc_time);
     printf("    glibc:   %8.2f ms\n", glibc_time);
-    mt_large_allocs_mbd(&mbd_time);
+    st_mix_mbd(&mbd_time);
     printf("    MyBuddy: %8.2f ms\n", mbd_time);
     printf("    Speedup: %8.2fx\n", glibc_time / mbd_time);
 
-    // Phase 6: Multi-thread Mix Test
-    printf("\n[6] Multi-Thread Mix Test (Alloc/Free/Realloc/Calloc, %d Threads)\n", NUM_THREADS);
+    // Phase 5: Multi-thread Mix Test
+    printf("\n[5] Multi-Thread Mix Test (Alloc/Free/Realloc/Calloc, %d Threads)\n", NUM_THREADS);
     mt_mix_glibc(&glibc_time);
     printf("    glibc:   %8.2f ms\n", glibc_time);
     mt_mix_mbd(&mbd_time);
