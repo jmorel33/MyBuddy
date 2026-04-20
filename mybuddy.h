@@ -660,6 +660,11 @@ static block_header_t* split_block_down(mbd_arena_t *arena, block_header_t *bloc
     while (atomic_load_explicit(&block->order, memory_order_relaxed) > target_order) {
         uint32_t new_order = atomic_load_explicit(&block->order, memory_order_relaxed) - 1;
         block_header_t *buddy = get_buddy(arena, block, new_order);
+
+        // Silence GCC LTO false positive: buddy is mathematically guaranteed
+        // to exist during a valid split, so it cannot be NULL.
+        if (!buddy) __builtin_unreachable();
+
         atomic_store_explicit(&buddy->order, new_order, memory_order_relaxed);
         atomic_store_explicit(&buddy->flags, 0, memory_order_relaxed);
         atomic_store_explicit(&buddy->magic, encode_magic(buddy, MAGIC_FREE), memory_order_release);
@@ -1162,6 +1167,11 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
             while (atomic_load_explicit(&block->order, memory_order_relaxed) > order) {
                 uint32_t new_order = atomic_load_explicit(&block->order, memory_order_relaxed) - 1;
                 block_header_t *buddy = get_buddy(locked_arena, block, new_order);
+
+                // Silence GCC LTO false positive: buddy is mathematically guaranteed
+                // to exist during a valid split, so it cannot be NULL.
+                if (!buddy) __builtin_unreachable();
+
 #if defined(__GNUC__) && !defined(__clang__)
 #pragma GCC diagnostic push
 #pragma GCC diagnostic ignored "-Wstringop-overflow"

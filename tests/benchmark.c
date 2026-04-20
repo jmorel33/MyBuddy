@@ -345,13 +345,15 @@ int main() {
     printf("=========================================\n");
 
     mbd_config_t bench_config = {0};
-    bench_config.flags = 0; // Ensure HARDENED and ATOMIC_STATS are OFF
+    bench_config.flags = MBD_FLAG_BUDDY_LARGE; // CRITICAL: Use buddy for large blocks, not mmap!
     bench_config.min_order = 6;
-    bench_config.small_order_max = 24; // Cache up to 16 MiB blocks!
-    bench_config.large_cutoff_order = 24;
-    bench_config.refill_batch_size = 32; // Grab 32 blocks at a time to avoid locks
-    bench_config.flush_low_watermark_pct = 20; // Keep caches very warm
-    bench_config.flush_high_watermark_pct = 95;
+    bench_config.small_order_max = 20;
+    bench_config.large_cutoff_order = 20;
+    bench_config.refill_batch_size = 0;    // CRITICAL: Unlimited batch refills
+    bench_config.mmap_cache_slots = 64;    // Cache mmap fallbacks heavily
+    bench_config.mmap_max_waste_ratio = 4;
+    bench_config.flush_high_watermark_pct = 100; // Only flush if 100% full
+    bench_config.flush_low_watermark_pct = 90;   // And only flush 10%
 
     // Give massive cache limits to the thread cache to prevent global lock thrashing
     for (int i = 6; i <= 20; i++) {
