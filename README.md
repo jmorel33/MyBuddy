@@ -107,6 +107,9 @@ Use `make test` inside the project to automatically run the suite!
 
 *Note: The allocator is self-initializing. The first call to `mbd_alloc()` or `mbd_free()` will automatically initialize the pool. For latency-sensitive applications, you may still call `mbd_init()` explicitly during startup.*
 
+### Thread Safety Contract
+`mbd_destroy()` must only be called after all threads using the allocator have exited. Violating this contract causes undefined behavior. The allocator will abort in debug and release builds if active threads are detected.
+
 ## Configuration Settings
 
 The allocator can be configured globally by passing an `mbd_config_t` struct to `mbd_init`. If passed as `NULL`, or if the allocator auto-initializes, safe performance-oriented defaults are used.
@@ -161,6 +164,13 @@ typedef struct {
 - **`max_remote_frees_per_lock`**: Limits the number of blocks drained from a remote free queue into an arena free list per operation to bound lock times. A value of 0 is unlimited. Defaults to 0.
 - **`migration_return_freq`**: How frequently an allocation checks to return to a thread's home arena after it was forced to migrate to another. Defaults to 64.
 - **`hugepage_threshold`**: Allocation sizes above this threshold will attempt to use huge pages. Defaults to 2 MiB.
+
+### Parameter Interactions
+| Parameter | Interacts With | Effect |
+|-----------|---------------|--------|
+| `cache_pressure_threshold` | `flush_high_watermark_pct` | Both can trigger flushes — which fires first? |
+| `refill_batch_size` | `cache_limits[]` | Batch > limit = wasted work |
+| `migration_return_freq` | `arena_count` | More arenas = more migration opportunities |
 
 ## API Reference
 
