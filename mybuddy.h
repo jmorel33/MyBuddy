@@ -2,7 +2,7 @@
  * @file mybuddy.h
  * @brief High-Performance Thread-Caching Buddy Allocator
  *
- * @version 1.5.0-RC3
+ * @version 1.5.1
  * @date April 19, 2026
  * @author Jacques Morel
  *
@@ -89,10 +89,11 @@ extern "C" {
 /* -- Configuration Macros ---------------------------------------------------- */
 /** @brief Configuration flags (can be combined with |) */
 #define MBD_FLAG_HARDENED          (1u << 0)  // 1. Randomized magic + full safety checks
-#define MBD_FLAG_ATOMIC_STATS      (1u << 1)  // 2. Update cached_bytes / cache_pressure on every alloc/free
+#define MBD_FLAG_ATOMIC_STATS      (1u << 1)  // 2. Update cached_bytes on every alloc/free
 #define MBD_FLAG_BUDDY_LARGE       (1u << 2)  // 3. Use buddy system for blocks > global_config.small_order_max (OFF = direct mmap)
 #define MBD_FLAG_REALLOC_LOCK      (1u << 3)  // 4. Take lock even on realloc shrinks (OFF = early return)
-#define MBD_FLAG_NUMA_AWARE        (1u << 4)  // 5. Bind thread arenas based on CPU core/NUMA node
+#define MBD_FLAG_CPU_LOCAL         (1u << 4)  // 5. Bind thread arenas based on CPU core/NUMA node
+#define MBD_FLAG_DETERMINISTIC     (1u << 5)  // 6. Disable adaptive heuristics (e.g., pressure flushing)
 
 #define MBD_MAX_POSSIBLE_ORDER 31
 
@@ -117,6 +118,7 @@ extern "C" {
 #define BLOCK_USED           (1u << 0)
 #define BLOCK_IS_MMAP        (1u << 1)
 #define BLOCK_IN_FREE_LIST   (1u << 2)
+// bit 3: reserved (was BLOCK_IS_SPLIT, removed in v1.4)
 #define BLOCK_IN_CACHE       (1u << 4)
 
 typedef struct {
@@ -263,7 +265,10 @@ typedef enum {
     MBD_EVENT_FREE,
     MBD_EVENT_SPLIT,
     MBD_EVENT_COALESCE,
-    MBD_EVENT_FLUSH
+    MBD_EVENT_FLUSH,
+    MBD_EVENT_PRESSURE_FLUSH,
+    MBD_EVENT_WATERMARK_FLUSH,
+    MBD_EVENT_MIGRATION
 } mbd_event_type_t;
 
 /**
@@ -458,7 +463,6 @@ typedef struct mbd_arena {
         _Atomic(block_header_t *) head;
     } remote_free_queue;
     _Atomic size_t cached_bytes;
-    _Atomic size_t cache_pressure;
     _Atomic uint64_t splits;
     _Atomic uint64_t coalesces;
     _Atomic int active;
@@ -682,7 +686,7 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
 
         // Reads safe under arena lock
         if (load_magic(buddy) != encode_magic(buddy, MAGIC_FREE) ||
-            atomic_load_explicit(&buddy->order, memory_order_relaxed) != order ||
+            atomic_load_explicit(&buddy->order, memory_order_acquire) != order ||
             buddy->arena != arena)
             break;
 
@@ -709,6 +713,12 @@ static block_header_t* coalesce_up_and_update(mbd_arena_t *arena, block_header_t
     *order_out = order;
     return block;
 }
+/* NOTE: This is a classic lock-free LIFO push with no ABA protection.
+ * In theory, a block can be pushed, popped, reused, and pushed again at the
+ * same address, causing CAS to succeed incorrectly. In practice, this requires
+ * extremely tight cross-thread timing that our workloads don't exhibit.
+ * If corruption is ever observed in stress tests, tagged pointers are the fix.
+ * See: https://en.wikipedia.org/wiki/ABA_problem */
 static inline void remote_push(mbd_arena_t *arena, block_header_t *block) {
     block->next = atomic_load_explicit(&arena->remote_free_queue.head, memory_order_acquire);
     while (!atomic_compare_exchange_weak(&arena->remote_free_queue.head, &block->next, block)) {
@@ -843,7 +853,6 @@ static void thread_cache_destructor(void *arg) {
 
             if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
                 atomic_fetch_sub(&block_arena->cached_bytes, 1ULL << o);
-                atomic_fetch_sub(&block_arena->cache_pressure, 1ULL << o);
             }
 
             if (atomic_load(&block_arena->active)) {
@@ -961,7 +970,6 @@ static void internal_init(void) {
         pthread_mutex_init(&arenas[a].lock, NULL);
         atomic_init(&arenas[a].remote_free_queue.head, NULL);
         atomic_init(&arenas[a].cached_bytes, 0);
-        atomic_init(&arenas[a].cache_pressure, 0);
         atomic_init(&arenas[a].splits, 0);
         atomic_init(&arenas[a].coalesces, 0);
         atomic_init(&arenas[a].active, 1);
@@ -1022,7 +1030,7 @@ static thread_cache_data_t *get_thread_cache_slow(void) {
         uint32_t t_id = atomic_fetch_add(&thread_counter, 1);
 
         uint32_t arena_idx;
-        if (global_config.flags & MBD_FLAG_NUMA_AWARE) {
+        if (global_config.flags & MBD_FLAG_CPU_LOCAL) {
             #if defined(__linux__)
                 int cpu = sched_getcpu();
                 arena_idx = (cpu >= 0) ? (uint32_t)(cpu % arena_count) : (t_id % arena_count);
@@ -1184,7 +1192,6 @@ static void refill_thread_cache(thread_cache_data_t *data, mbd_arena_t *locked_a
                     data->total_cached += (1ULL << new_order);
                     if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
                         atomic_fetch_add(&locked_arena->cached_bytes, 1ULL << new_order);
-                        atomic_fetch_add(&locked_arena->cache_pressure, 1ULL << new_order);
                     }
                 } else {
                     atomic_store_explicit(&buddy->magic, encode_magic(buddy, MAGIC_FREE), memory_order_release);
@@ -1255,7 +1262,12 @@ void mbd_destroy(void) {
         pthread_setspecific(thread_cache_key, NULL);
     }
 
-    assert(atomic_load(&active_threads) == 0 && "mbd_destroy called while other threads are active!");
+    if (atomic_load_explicit(&active_threads, memory_order_acquire) != 0) {
+        fprintf(stderr, "FATAL: mbd_destroy() called with %u active threads. "
+                "All threads must exit before destroy.\n",
+                atomic_load(&active_threads));
+        abort();
+    }
     
     for (int a = 0; a < arena_count; a++) {
         atomic_store(&arenas[a].active, 0);
@@ -1416,7 +1428,6 @@ void *mbd_alloc(size_t requested_size) {
             data->total_cached -= (1ULL << order);
             if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
                 atomic_fetch_sub(&arena->cached_bytes, 1ULL << order);
-                atomic_fetch_sub(&arena->cache_pressure, 1ULL << order);
             }
             atomic_store_explicit(&block->flags, BLOCK_USED, memory_order_relaxed);
             atomic_store_explicit(&block->magic, encode_magic(block, MAGIC_ALLOC), memory_order_release);
@@ -1455,6 +1466,7 @@ void *mbd_alloc(size_t requested_size) {
 
                 /* NEW: Migrate thread to the arena that actually has memory */
                 atomic_store(&data->arena, other_arena); 
+                MBD_FIRE_EVENT(MBD_EVENT_MIGRATION, data, 0);
 
                 /* Probabilistic return to native arena to prevent long-term crowding */
                 static __thread uint32_t migration_counter = 0;
@@ -1462,6 +1474,7 @@ void *mbd_alloc(size_t requested_size) {
                 if (global_config.migration_return_freq > 0 && 
                    (migration_counter % global_config.migration_return_freq) == 0) {
                     atomic_store(&data->arena, data->native_arena);
+                    MBD_FIRE_EVENT(MBD_EVENT_MIGRATION, data, 0);
                 }
 
                 void *res = (void *)((uint8_t*)block + HEADER_SIZE);
@@ -1657,7 +1670,6 @@ void mbd_free(void *ptr) {
         data->total_cached += (1ULL << order);
         if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
             atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-            atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
         }
         return;
     }
@@ -1666,7 +1678,7 @@ void mbd_free(void *ptr) {
     if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
         atomic_fetch_add_explicit(&data->bulk_flushes, 1, memory_order_relaxed);
     }
-    MBD_FIRE_EVENT(MBD_EVENT_FLUSH, data, limit / 2);
+
     mbd_arena_t *locked_arena = NULL;
     
     for (uint32_t o = global_config.min_order; o <= global_config.small_order_max; o++) {
@@ -1677,8 +1689,13 @@ void mbd_free(void *ptr) {
         uint32_t high_watermark = (o_limit * global_config.flush_high_watermark_pct) / 100;
         uint32_t low_watermark = (o_limit * global_config.flush_low_watermark_pct) / 100;
 
-        if (current_count >= high_watermark || data->total_cached >= global_config.cache_pressure_threshold) {
+        int deterministic = global_config.flags & MBD_FLAG_DETERMINISTIC;
+        if (current_count >= high_watermark) {
             flush_count = (current_count > low_watermark) ? (int)(current_count - low_watermark) : 0;
+            if (flush_count > 0) MBD_FIRE_EVENT(MBD_EVENT_WATERMARK_FLUSH, data, flush_count);
+        } else if (!deterministic && data->total_cached >= global_config.cache_pressure_threshold) {
+            flush_count = (current_count > low_watermark) ? (int)(current_count - low_watermark) : 0;
+            if (flush_count > 0) MBD_FIRE_EVENT(MBD_EVENT_PRESSURE_FLUSH, data, flush_count);
         }
         
         while (flush_count > 0 && data->cache[o]) {
@@ -1706,7 +1723,6 @@ void mbd_free(void *ptr) {
             arena_insert(locked_arena, coalesced_order, to_global);
             if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
                 atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
-                atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
             }
         }
     } // End of o loop
@@ -1724,7 +1740,6 @@ void mbd_free(void *ptr) {
         data->total_cached += (1ULL << order);
         if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
             atomic_fetch_add(&block->arena->cached_bytes, 1ULL << order);
-            atomic_fetch_add(&block->arena->cache_pressure, 1ULL << order);
         }
     } else {
         mbd_arena_t *block_arena = block->arena;
@@ -1972,7 +1987,6 @@ static void flush_my_cache(thread_cache_data_t *curr) {
 
             if (global_config.flags & MBD_FLAG_ATOMIC_STATS) {
                 atomic_fetch_sub(&locked_arena->cached_bytes, 1ULL << original_order);
-                atomic_fetch_sub(&locked_arena->cache_pressure, 1ULL << original_order);
             }
             curr->total_cached -= (1ULL << original_order);
         }
