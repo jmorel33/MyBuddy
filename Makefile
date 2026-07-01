@@ -1,34 +1,42 @@
 CC = gcc
-CFLAGS = -Wall -Wextra -O2 -pthread
-BENCH_CFLAGS = -Wall -Wextra -O3 -flto -march=native -DNDEBUG -pthread
+CFLAGS = -Wall -Wextra -O2 -pthread -Wno-stringop-overflow
+BENCH_CFLAGS = -Wall -Wextra -O3 -flto -march=native -DNDEBUG -pthread -Wno-stringop-overflow
+
+# MinGW on Windows requires -lbcrypt for BCryptGenRandom (entropy source)
+# On Linux/macOS this is a no-op (bcrypt lib doesn't exist, flag ignored by ld)
+ifeq ($(OS),Windows_NT)
+    EXTRA_LIBS = -lbcrypt
+else
+    EXTRA_LIBS =
+endif
 
 TESTS = tests/test_basic tests/test_threads tests/test_huge tests/test_string_view tests/test_usable_size tests/test_multithread_stress tests/test_brutal tests/benchmark
 
 all: $(TESTS)
 
 tests/benchmark: tests/benchmark.c mybuddy.h
-	$(CC) $(BENCH_CFLAGS) $< -o $@
+	$(CC) $(BENCH_CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 tests/test_basic: tests/test_basic.c mybuddy.h
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 tests/test_threads: tests/test_threads.c mybuddy.h
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 tests/test_huge: tests/test_huge.c mybuddy.h
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 tests/test_string_view: tests/test_string_view.c mybuddy.h mbd_strings.h
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 tests/test_usable_size: tests/test_usable_size.c mybuddy.h
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 tests/test_multithread_stress: tests/test_multithread_stress.c mybuddy.h
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 tests/test_brutal: tests/test_brutal.c mybuddy.h
-	$(CC) $(CFLAGS) $< -o $@
+	$(CC) $(CFLAGS) $< -o $@ $(EXTRA_LIBS)
 
 bench: tests/benchmark
 	@./tests/benchmark

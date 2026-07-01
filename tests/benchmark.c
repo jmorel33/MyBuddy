@@ -6,6 +6,18 @@
 #include <time.h>
 #include <pthread.h>
 
+/* ── rand_r portability shim ─────────────────────────────────────────────
+ * rand_r() is POSIX and absent on MinGW. Substitute with a fast, reentrant
+ * LCG (Knuth MMIX constants) that matches rand_r's interface exactly.
+ * The shim is only compiled on Windows; Linux/macOS use the native rand_r.
+ */
+#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_WIN32)
+static inline int rand_r(unsigned int *seed) {
+    *seed = (*seed) * 1664525u + 1013904223u;  // Numerical Recipes LCG, all 32-bit
+    return (int)((*seed >> 1) & 0x7fffffff);
+}
+#endif
+
 #define ITERATIONS 1000000
 #define NUM_THREADS 4
 #define MIX_ITERATIONS 500000
@@ -15,9 +27,16 @@
 // To be implemented in next steps
 
 double get_time_ms() {
+#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_WIN32)
+    LARGE_INTEGER freq, now;
+    QueryPerformanceFrequency(&freq);
+    QueryPerformanceCounter(&now);
+    return (double)now.QuadPart * 1000.0 / (double)freq.QuadPart;
+#else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return ts.tv_sec * 1000.0 + ts.tv_nsec / 1000000.0;
+#endif
 }
 
 // Single-thread small allocations (glibc vs MyBuddy)
@@ -360,7 +379,13 @@ int main() {
         else if (i <= 16) bench_config.cache_limits[i] = 1024;
         else              bench_config.cache_limits[i] = 256;
     }
-    bench_config.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size
+    bench_config.pool_size = 1ULL * 1024 * 1024 * 1024; // 1 GB pool size per arena
+    // On Windows, VirtualAlloc reserves all arenas upfront; cap to 256 MiB per arena
+    // to avoid exhausting virtual address space with many arenas (16+ arenas × 1 GB = 16+ GB).
+#if defined(__MINGW32__) || defined(__MINGW64__) || defined(_WIN32)
+    bench_config.pool_size = 256ULL * 1024 * 1024; // 256 MiB per arena on Windows
+    bench_config.arena_count = 8;                   // Fixed 8 arenas to keep VA manageable
+#endif
 
     mbd_init(&bench_config);
 
